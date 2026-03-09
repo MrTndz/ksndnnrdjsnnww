@@ -1,9 +1,17 @@
-aiogram>=3.4.0
-openai>=1.0.0
-aiosqlite>=0.20.0
-python-dotenv>=1.0.0
-aiohttp>=3.9.0
-pillow>=10.0.0
-cryptography>=41.0.0
-psutil>=5.9.0
-google-generativeai>=0.3.0
+# MerAi & Monitoring v6.0 - ИСПРАВЛЕННАЯ ВЕРСИЯ
+# Дата: 9 марта 2026, 19:13 МСК
+# Актуальные версии библиотек на март 2026
+
+# Telegram Bot Framework (март 2026)
+aiogram==3.26.0
+
+# Userbot (MTProto)
+Pyrogram==2.0.106
+TgCrypto==1.2.5
+
+# База данных
+aiosqlite==0.20.0
+
+# Утилиты
+aiohttp==3.10.5
+aiofiles==24.1.0
