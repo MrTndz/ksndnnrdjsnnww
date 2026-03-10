@@ -2,20 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   MerAi & Monitoring v8.1                                       ║
-║   Автор: @mrztn  |  Дата: 10.03.2026                            ║
+║   MerAi & Monitoring v8.0                                       ║
+║   Автор: @mrztn  |  Дата: 09.03.2026                            ║
 ║   Python 3.11+  |  aiogram 3.26.0  |  Pyrogram 2.0.106          ║
-║   Telegram Bot API 9.5  |  ОБНОВЛЕНО ПОД 2026                   ║
+║   Telegram Bot API 9.5                                           ║
 ╚══════════════════════════════════════════════════════════════════╝
-
-CHANGELOG v8.1 (10.03.2026):
-+ Сохранение ЛЮБЫХ сообщений в ЛС боту или по реплаю "тест"
-+ Inline-клавиатура для ввода кода/пароля userbot (защита от детекта)
-+ Free план → Тестовый период 3 дня с полным функционалом
-+ Автоматическая верификация канала перед каждым действием
-+ Блокировка при выходе из канала
-+ Расширенная админ-панель конфига
-+ Обновлены все API под стандарты марта 2026
 """
 
 # ═══════════════════════════════════════════════════════════════════
@@ -74,11 +65,8 @@ PLANS = {
     "year":    {"name": "🎯 Год",       "stars": 2500, "days": 365},
 }
 
-# Новые параметры v8.1
-TEST_PERIOD_DAYS = 3  # Тестовый период вместо free
 CLONE_BONUS_DAYS = 3
 REF_GOAL         = 50
-CHANNEL_CHECK_INTERVAL = 3600  # Проверка канала каждый час
 
 TERMS_TEXT = (
     "<b>📜 Условия использования MerAi &amp; Monitoring</b>\n\n"
@@ -102,9 +90,6 @@ TERMS_TEXT = (
     "<b>6. Право на блокировку</b>\n"
     "Администрация вправе заблокировать любой аккаунт без предупреждения и без "
     "возврата средств при нарушении настоящих условий или правил Telegram.\n\n"
-    "<b>7. Тестовый период</b>\n"
-    "Новые пользователи получают 3 дня полного доступа для ознакомления с сервисом. "
-    "После истечения тестового периода требуется приобретение платного тарифа.\n\n"
     "<i>© 2026 MerAi &amp; Monitoring. Все права защищены.</i>"
 )
 
@@ -132,7 +117,8 @@ class UserBotSt(StatesGroup):
     api_id   = State()
     api_hash = State()
     phone    = State()
-    # Удалены code и twofa - теперь через inline-клавиатуру
+    code     = State()
+    twofa    = State()
 
 class CloneSt(StatesGroup):
     token = State()
@@ -172,10 +158,8 @@ class DB:
                 first_name       TEXT,
                 is_verified      INTEGER DEFAULT 0,
                 mode             TEXT    DEFAULT 'none',
-                plan             TEXT    DEFAULT 'trial',
+                plan             TEXT    DEFAULT 'free',
                 plan_expires     TEXT,
-                trial_expires    TEXT,
-                trial_used       INTEGER DEFAULT 0,
                 auto_renew       INTEGER DEFAULT 0,
                 referrer_id      INTEGER,
                 referral_count   INTEGER DEFAULT 0,
@@ -183,7 +167,6 @@ class DB:
                 is_banned        INTEGER DEFAULT 0,
                 monitoring_on    INTEGER DEFAULT 0,
                 channel_member   INTEGER DEFAULT 0,
-                channel_left     INTEGER DEFAULT 0,
                 biz_connected    INTEGER DEFAULT 0,
                 ub_session       TEXT,
                 ub_phone         TEXT,
@@ -191,8 +174,7 @@ class DB:
                 pyro_api_id      INTEGER DEFAULT 0,
                 pyro_api_hash    TEXT    DEFAULT '',
                 created_at       TEXT    DEFAULT (datetime('now')),
-                last_active      TEXT    DEFAULT (datetime('now')),
-                last_channel_check TEXT  DEFAULT (datetime('now'))
+                last_active      TEXT    DEFAULT (datetime('now'))
             );
 
             CREATE TABLE IF NOT EXISTS cloned_bots (
@@ -231,7 +213,6 @@ class DB:
                 media_bytes  BLOB,
                 ttl_seconds  INTEGER,
                 view_once    INTEGER DEFAULT 0,
-                saved_by_cmd INTEGER DEFAULT 0,
                 ts           TEXT DEFAULT (datetime('now')),
                 cached_at    TEXT DEFAULT (datetime('now')),
                 UNIQUE(owner_id, chat_id, msg_id)
@@ -298,23 +279,18 @@ class DB:
                 value TEXT
             );
         """)
-        # Вставить дефолтные конфиги v8.1
+        # Вставить дефолтные конфиги
         await cls._conn.executemany(
             "INSERT OR IGNORE INTO system_config (key, value) VALUES (?,?)",
             [
-                ("pyro_api_id",         "0"),
-                ("pyro_api_hash",       ""),
-                ("ref_goal",            "50"),
-                ("clone_bonus_days",    "3"),
-                ("test_period_days",    "3"),
-                ("auto_verify_enabled", "1"),
-                ("channel_check_hours", "1"),
-                ("save_dm_messages",    "1"),
-                ("save_test_replies",   "1"),
+                ("pyro_api_id",      "0"),
+                ("pyro_api_hash",    ""),
+                ("ref_goal",         "50"),
+                ("clone_bonus_days", "3"),
             ]
         )
         await cls._conn.commit()
-        log.info("✅ БД подключена (v8.1)")
+        log.info("✅ БД подключена")
 
     @classmethod
     async def close(cls):
@@ -366,6 +342,7 @@ class DB:
                     "INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?,?)",
                     (referrer, uid)
                 )
+                # Увеличиваем счётчик только если запись была новой
                 await cls._conn.execute("""
                     UPDATE users SET referral_count = referral_count + 1
                     WHERE user_id=? AND (
@@ -379,26 +356,15 @@ class DB:
 
     @classmethod
     async def verify(cls, uid: int):
-        """v8.1: Верификация + активация тестового периода"""
-        test_days = int(await cls.get_config("test_period_days", "3"))
-        trial_exp = (datetime.now(timezone.utc) + timedelta(days=test_days)).isoformat()
-        
-        await cls._conn.execute("""
-            UPDATE users SET 
-                is_verified=1, 
-                channel_member=1,
-                trial_expires=?,
-                trial_used=0,
-                plan='trial'
-            WHERE user_id=?
-        """, (trial_exp, uid))
+        await cls._conn.execute(
+            "UPDATE users SET is_verified=1, channel_member=1 WHERE user_id=?", (uid,)
+        )
         await cls._conn.commit()
 
     @classmethod
     async def set_plan(cls, uid: int, plan: str, days: int):
-        """v8.1: Установка платного плана (отключает trial)"""
         u = await cls.get_user(uid)
-        if u and u["plan_expires"] and u["plan"] not in ("trial", "free"):
+        if u and u["plan_expires"] and u["plan"] != "free":
             try:
                 exp = datetime.fromisoformat(u["plan_expires"])
                 if exp.tzinfo is None:
@@ -411,47 +377,29 @@ class DB:
                 new_exp = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
         else:
             new_exp = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-        
         await cls._conn.execute(
-            "UPDATE users SET plan=?, plan_expires=?, trial_used=1 WHERE user_id=?",
+            "UPDATE users SET plan=?, plan_expires=? WHERE user_id=?",
             (plan, new_exp, uid)
         )
         await cls._conn.commit()
 
     @classmethod
     async def plan_active(cls, uid: int) -> bool:
-        """v8.1: Проверка активности плана (включая trial)"""
         u = await cls.get_user(uid)
-        if not u:
+        if not u or u["plan"] == "free" or not u["plan_expires"]:
             return False
-        
-        # Проверка trial
-        if u["plan"] == "trial" and not u["trial_used"] and u["trial_expires"]:
-            try:
-                exp = datetime.fromisoformat(u["trial_expires"])
-                if exp.tzinfo is None:
-                    exp = exp.replace(tzinfo=timezone.utc)
-                if exp > datetime.now(timezone.utc):
-                    return True
-            except Exception:
-                pass
-        
-        # Проверка платного плана
-        if u["plan"] not in ("trial", "free") and u["plan_expires"]:
-            try:
-                exp = datetime.fromisoformat(u["plan_expires"])
-                if exp.tzinfo is None:
-                    exp = exp.replace(tzinfo=timezone.utc)
-                return exp > datetime.now(timezone.utc)
-            except Exception:
-                pass
-        
-        return False
+        try:
+            exp = datetime.fromisoformat(u["plan_expires"])
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            return exp > datetime.now(timezone.utc)
+        except Exception:
+            return False
 
     @classmethod
     async def add_days(cls, uid: int, days: int):
         u = await cls.get_user(uid)
-        if u and u["plan_expires"] and u["plan"] not in ("trial", "free"):
+        if u and u["plan_expires"] and u["plan"] != "free":
             try:
                 exp = datetime.fromisoformat(u["plan_expires"])
                 if exp.tzinfo is None:
@@ -462,7 +410,7 @@ class DB:
         else:
             new_exp = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
             await cls._conn.execute(
-                "UPDATE users SET plan='week' WHERE user_id=? AND plan IN ('trial','free')", (uid,)
+                "UPDATE users SET plan='week' WHERE user_id=? AND plan='free'", (uid,)
             )
         await cls._conn.execute(
             "UPDATE users SET plan_expires=? WHERE user_id=?", (new_exp, uid)
@@ -488,18 +436,17 @@ class DB:
                         sender_id: int, sender_name: str, chat_title: str,
                         msg_type: str, content: str = None, file_id: str = None,
                         media_bytes: bytes = None, ttl_seconds: int = None,
-                        view_once: int = 0, saved_by_cmd: int = 0):
-        """v8.1: Добавлен флаг saved_by_cmd для сообщений, сохранённых по команде"""
+                        view_once: int = 0):
         try:
             await cls._conn.execute("""
                 INSERT OR REPLACE INTO msg_cache
                 (owner_id, chat_id, msg_id, sender_id, sender_name,
                  chat_title, msg_type, content, file_id, media_bytes,
-                 ttl_seconds, view_once, saved_by_cmd)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 ttl_seconds, view_once)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """, (owner_id, chat_id, msg_id, sender_id, sender_name,
                   chat_title, msg_type, content, file_id, media_bytes,
-                  ttl_seconds, view_once, saved_by_cmd))
+                  ttl_seconds, view_once))
             await cls._conn.commit()
         except Exception as e:
             log.debug(f"cache_msg err: {e}")
@@ -715,13 +662,9 @@ class DB:
         ) as c:
             (verified,) = await c.fetchone()
         async with cls._conn.execute(
-            "SELECT COUNT(*) FROM users WHERE plan NOT IN ('trial','free')"
+            "SELECT COUNT(*) FROM users WHERE plan!='free'"
         ) as c:
             (paid,) = await c.fetchone()
-        async with cls._conn.execute(
-            "SELECT COUNT(*) FROM users WHERE plan='trial' AND trial_used=0"
-        ) as c:
-            (trial,) = await c.fetchone()
         async with cls._conn.execute(
             "SELECT COUNT(*) FROM cloned_bots WHERE is_active=1"
         ) as c:
@@ -737,7 +680,7 @@ class DB:
         ) as c:
             (tickets,) = await c.fetchone()
         return {
-            "total": total, "verified": verified, "paid": paid, "trial": trial,
+            "total": total, "verified": verified, "paid": paid,
             "clones": clones, "stars": stars, "deletions": dels,
             "tickets": tickets,
         }
@@ -748,8 +691,8 @@ class DB:
 
 mem_cache:    Dict[int, deque]         = defaultdict(lambda: deque(maxlen=5000))
 ub_clients:   Dict[int, PyroClient]   = {}
-clone_bots:   Dict[str, tuple]        = {}
-ub_auth_data: Dict[int, dict]         = {}  # v8.1: хранит код/пароль через inline
+clone_bots:   Dict[str, tuple]        = {}   # token -> (Bot, Dispatcher, task)
+ub_auth_data: Dict[int, dict]         = {}
 bot_instance: Optional[Bot]           = None
 BOT_USERNAME: str                     = ""
 
@@ -764,6 +707,7 @@ def ikb(*rows) -> InlineKeyboardMarkup:
     ])
 
 def ikb_url(*rows) -> InlineKeyboardMarkup:
+    """Поддерживает смешанные кнопки: (text, data, url?) — если url начинается с http, делает url-кнопку."""
     buttons = []
     for row in rows:
         btn_row = []
@@ -777,7 +721,7 @@ def ikb_url(*rows) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def plan_emoji(plan: str) -> str:
-    return {"free": "🆓", "trial": "🎁", "week": "📅", "month": "📆",
+    return {"free": "🆓", "week": "📅", "month": "📆",
             "quarter": "📊", "year": "🎯"}.get(plan, "❓")
 
 def fmt_exp(exp_str: Optional[str]) -> str:
@@ -801,56 +745,11 @@ def h(s) -> str:
     return html_module.escape(str(s or ""))
 
 async def check_channel_membership(bot_obj: Bot, user_id: int) -> bool:
-    """v8.1: Проверка членства в канале с обновлением БД"""
     try:
         member = await bot_obj.get_chat_member(CAPTCHA_CHAN_ID, user_id)
-        is_member = member.status.value in ("member", "administrator", "creator", "restricted")
-        
-        # Обновляем статус в БД
-        await DB.set_field(user_id, "channel_member", 1 if is_member else 0)
-        await DB.set_field(user_id, "channel_left", 0 if is_member else 1)
-        await DB.set_field(user_id, "last_channel_check", datetime.now().isoformat())
-        
-        return is_member
+        return member.status.value in ("member", "administrator", "creator", "restricted")
     except Exception:
         return False
-
-async def verify_and_check_channel(user_id: int) -> tuple[bool, str]:
-    """
-    v8.1: Комплексная проверка перед выполнением действия
-    Returns: (can_proceed, error_message)
-    """
-    user = await DB.get_user(user_id)
-    if not user:
-        return False, "❌ Пользователь не найден в базе"
-    
-    if user["is_banned"]:
-        return False, "🚫 Ваш аккаунт заблокирован"
-    
-    # Проверка членства в канале
-    if not user["is_verified"]:
-        return False, "❌ Необходимо пройти верификацию через /start"
-    
-    # Автоматическая проверка канала
-    auto_verify = await DB.get_config("auto_verify_enabled", "1")
-    if auto_verify == "1":
-        is_member = await check_channel_membership(bot_instance, user_id)
-        if not is_member or user["channel_left"]:
-            return False, (
-                "❌ <b>Вы покинули канал верификации!</b>\n\n"
-                f"Для продолжения работы вступите обратно:\n{CAPTCHA_CHANNEL}\n\n"
-                "После вступления нажмите /start"
-            )
-    
-    # Проверка активности плана
-    if not await DB.plan_active(user_id):
-        return False, (
-            "⚠️ <b>Подписка истекла!</b>\n\n"
-            "Ваш тестовый период или платный тариф закончился.\n"
-            "Приобретите план для продолжения: /plan"
-        )
-    
-    return True, ""
 
 # ── Уведомления ──────────────────────────────────────────────────
 
@@ -917,27 +816,6 @@ def notif_bulk(chat: str, count: int) -> str:
         f"📦 Генерирую ZIP-архив…"
     )
 
-def notif_saved_dm(sender: str, mtype: str) -> str:
-    """v8.1: Уведомление о сохранении сообщения в ЛС"""
-    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
-    return (
-        f"💾 <b>Сообщение сохранено (ЛС боту)</b>\n"
-        f"┌ 👤 <b>От:</b> {h(sender)}\n"
-        f"├ {mtype_icon(mtype)} <b>Тип:</b> {mtype.replace('_',' ').title()}\n"
-        f"└ 🕐 <b>Время:</b> {ts}"
-    )
-
-def notif_saved_test(sender: str, chat: str, mtype: str) -> str:
-    """v8.1: Уведомление о сохранении по команде 'тест'"""
-    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
-    return (
-        f"💾 <b>Сообщение сохранено (команда 'тест')</b>\n"
-        f"┌ 👤 <b>Кто:</b> {h(sender)}\n"
-        f"├ 💬 <b>Чат:</b> {h(chat)}\n"
-        f"├ {mtype_icon(mtype)} <b>Тип:</b> {mtype.replace('_',' ').title()}\n"
-        f"└ 🕐 <b>Время:</b> {ts}"
-    )
-
 # ── HTML / ZIP архив ─────────────────────────────────────────────
 
 def _html_report(msgs: List[dict], chat_title: str) -> str:
@@ -949,7 +827,6 @@ def _html_report(msgs: List[dict], chat_title: str) -> str:
         content = h(m.get("content") or "")
         icon    = mtype_icon(mtype)
         mb      = m.get("media_bytes")
-        saved_by = " 💾" if m.get("saved_by_cmd") else ""
         media_tag = ""
         if mb and mtype == "photo" and len(mb) < 500_000:
             b64 = base64.b64encode(mb).decode()
@@ -958,7 +835,7 @@ def _html_report(msgs: List[dict], chat_title: str) -> str:
             media_tag = f'<i>[файл приложен в архив: media/msg_{m.get("msg_id","?")}.dat]</i><br>'
         rows += (
             f'<div class="msg">'
-            f'<span class="meta">{icon}{saved_by} <b>{sender}</b> · <span class="ts">{ts}</span></span>'
+            f'<span class="meta">{icon} <b>{sender}</b> · <span class="ts">{ts}</span></span>'
             f'<div class="body">{media_tag}{content or f"<i>[{mtype}]</i>"}</div>'
             f'</div>\n'
         )
@@ -974,7 +851,6 @@ def _html_report(msgs: List[dict], chat_title: str) -> str:
 </style></head><body>
 <h1>📦 Архив: {h(chat_title)}</h1>
 <p style="color:#7eb8d4">Экспортировано: {datetime.now().strftime('%d.%m.%Y %H:%M UTC')}</p>
-<p style="color:#7eb8d4">💾 = сохранено вручную командой</p>
 {rows}
 </body></html>"""
 
@@ -995,47 +871,6 @@ async def build_zip(owner_id: int, chat_id: int, chat_title: str) -> bytes:
                 zf.writestr(f"media/msg_{m['msg_id']}.{ext}", m["media_bytes"])
     buf.seek(0)
     return buf.read()
-
-# ── Inline-клавиатура для ввода кода/пароля ──────────────────────
-
-def inline_numpad(current_code: str = "", purpose: str = "code") -> InlineKeyboardMarkup:
-    """
-    v8.1: Числовая клавиатура для безопасного ввода кода/пароля
-    purpose: 'code' или 'password'
-    """
-    buttons = []
-    # Показываем текущий ввод
-    display = f"{'*' * len(current_code) if purpose == 'password' else current_code}"
-    buttons.append([InlineKeyboardButton(
-        text=f"📱 {display or '___'}", 
-        callback_data="numpad_display"
-    )])
-    
-    # Цифры 1-9
-    for row in range(3):
-        btn_row = []
-        for col in range(3):
-            num = row * 3 + col + 1
-            btn_row.append(InlineKeyboardButton(
-                text=str(num),
-                callback_data=f"numpad_{purpose}_{num}"
-            ))
-        buttons.append(btn_row)
-    
-    # Нижний ряд: ←, 0, ✅
-    buttons.append([
-        InlineKeyboardButton(text="←", callback_data=f"numpad_{purpose}_back"),
-        InlineKeyboardButton(text="0", callback_data=f"numpad_{purpose}_0"),
-        InlineKeyboardButton(text="✅", callback_data=f"numpad_{purpose}_submit"),
-    ])
-    
-    # Отмена
-    buttons.append([InlineKeyboardButton(
-        text="❌ Отмена",
-        callback_data="ub_cancel_auth"
-    )])
-    
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ═══════════════════════════════════════════════════════════════════
 #  6. PYROGRAM USERBOT
@@ -1094,7 +929,7 @@ async def _handle_new_pyro(client: "PyroClient", msg: "PyroMessage"):
         has_spoiler = getattr(msg, "has_media_spoiler", False)
         is_view_once = has_spoiler or (ttl == 0 and msg.media and getattr(msg, "once", False))
 
-        # Скачиваем медиа для TTL/view_once
+        # Скачиваем медиа для TTL/view_once синхронно
         media_raw = None
         if ttl or is_view_once:
             if msg.media:
@@ -1116,7 +951,7 @@ async def _handle_new_pyro(client: "PyroClient", msg: "PyroMessage"):
         if not u or not u["monitoring_on"]:
             return
 
-        # Уведомления для TTL/view_once (как было)
+        # Уведомление для TTL
         if ttl:
             note = notif_autodestruct(sender, title, mtype, ttl)
             if media_raw:
@@ -1135,6 +970,7 @@ async def _handle_new_pyro(client: "PyroClient", msg: "PyroMessage"):
                     pass
             await bot_instance.send_message(owner_id, note, parse_mode=ParseMode.HTML)
 
+        # Уведомление для view_once
         elif is_view_once:
             note = notif_view_once(sender, title, mtype)
             if media_raw:
@@ -1151,6 +987,7 @@ async def _handle_new_pyro(client: "PyroClient", msg: "PyroMessage"):
 
     except Exception as e:
         log.debug(f"[UB new] owner={owner_id}: {e}")
+
 
 async def _handle_deleted_pyro(client: "PyroClient", msgs):
     owner_id = client._owner_id
@@ -1277,6 +1114,7 @@ async def _handle_deleted_pyro(client: "PyroClient", msgs):
     except Exception as e:
         log.error(f"[UB del] owner={owner_id}: {e}")
 
+
 async def _handle_edited_pyro(client: "PyroClient", msg: "PyroMessage"):
     owner_id = client._owner_id
     try:
@@ -1297,6 +1135,7 @@ async def _handle_edited_pyro(client: "PyroClient", msg: "PyroMessage"):
             cached["text"] = new_t
     except Exception as e:
         log.debug(f"[UB edited] owner={owner_id}: {e}")
+
 
 async def start_userbot(owner_id: int, session_str: str,
                         api_id: int, api_hash: str) -> bool:
@@ -1327,6 +1166,7 @@ async def start_userbot(owner_id: int, session_str: str,
         log.error(f"Userbot start err owner={owner_id}: {e}")
         return False
 
+
 async def stop_userbot(owner_id: int):
     if owner_id in ub_clients:
         try:
@@ -1334,6 +1174,7 @@ async def stop_userbot(owner_id: int):
         except Exception:
             pass
         del ub_clients[owner_id]
+
 
 async def ub_send_code(owner_id: int, phone: str,
                        api_id: int, api_hash: str) -> Optional[str]:
@@ -1349,29 +1190,21 @@ async def ub_send_code(owner_id: int, phone: str,
         await client.connect()
         sent = await client.send_code(phone)
         ub_auth_data[owner_id] = {
-            "client": client, 
-            "phone": phone, 
-            "hash": sent.phone_code_hash,
-            "code": "",  # v8.1: храним код, вводимый через inline
-            "password": "",  # v8.1: и пароль тоже
+            "client": client, "phone": phone, "hash": sent.phone_code_hash,
         }
         return sent.phone_code_hash
     except Exception as e:
         log.error(f"ub_send_code err: {e}")
         return None
 
-async def ub_sign_in(owner_id: int) -> Optional[str]:
-    """v8.1: Авторизация с кодом/паролем из inline-клавиатуры"""
+
+async def ub_sign_in(owner_id: int, code: str, password: str = None) -> Optional[str]:
     data = ub_auth_data.get(owner_id)
     if not data:
         return None
-    
     client = data["client"]
     phone  = data["phone"]
     phash  = data["hash"]
-    code   = data["code"]
-    password = data.get("password")
-    
     try:
         try:
             await client.sign_in(phone, phash, code)
@@ -1400,7 +1233,7 @@ def create_router(is_clone: bool = False,
                   clone_id: int = None,
                   clone_bot_instance: Optional[Bot] = None) -> Router:
     r = Router()
-    
+    # Определяем, какой bot-экземпляр использовать
     def _bot() -> Bot:
         return clone_bot_instance if (is_clone and clone_bot_instance) else bot_instance
 
@@ -1408,153 +1241,6 @@ def create_router(is_clone: bool = False,
         f'\n\n<i>Powered by <a href="https://t.me/mrztn">@mrztn</a> · '
         f'<a href="https://t.me/{BOT_USERNAME}">MerAi</a></i>'
     ) if is_clone else ""
-
-    # ══════════════════════════════════════════════════════════════
-    #  v8.1: СОХРАНЕНИЕ СООБЩЕНИЙ В ЛС И ПО РЕПЛАЮ "ТЕСТ"
-    # ══════════════════════════════════════════════════════════════
-
-    async def save_message_to_cache(msg: Message, owner_id: int, reason: str = "dm"):
-        """
-        v8.1: Сохранение сообщения в кэш с флагом saved_by_cmd
-        reason: 'dm' (личные сообщения) или 'test' (по команде тест)
-        """
-        try:
-            # Определяем тип сообщения
-            mtype = "text"
-            content = msg.text or msg.caption or ""
-            file_id = None
-            media_bytes = None
-            ttl = None
-            view_once = 0
-            
-            # Проверяем медиа
-            if msg.photo:
-                mtype = "photo"
-                file_id = msg.photo[-1].file_id
-            elif msg.video:
-                mtype = "video"
-                file_id = msg.video.file_id
-                ttl = getattr(msg.video, "ttl_seconds", None)
-            elif msg.voice:
-                mtype = "voice"
-                file_id = msg.voice.file_id
-            elif msg.video_note:
-                mtype = "video_note"
-                file_id = msg.video_note.file_id
-            elif msg.document:
-                mtype = "document"
-                file_id = msg.document.file_id
-            elif msg.sticker:
-                mtype = "sticker"
-                file_id = msg.sticker.file_id
-            elif msg.animation:
-                mtype = "animation"
-                file_id = msg.animation.file_id
-            elif msg.audio:
-                mtype = "audio"
-                file_id = msg.audio.file_id
-            elif msg.contact:
-                mtype = "contact"
-            
-            # Скачиваем медиа (включая таймерные)
-            if file_id:
-                try:
-                    fi = await _bot().get_file(file_id)
-                    dl = await _bot().download_file(fi.file_path)
-                    media_bytes = dl.read()
-                except Exception as e:
-                    log.debug(f"save_message download err: {e}")
-            
-            # Определяем отправителя и чат
-            sender_name = msg.from_user.full_name if msg.from_user else "Unknown"
-            sender_id = msg.from_user.id if msg.from_user else 0
-            chat_title = getattr(msg.chat, "title", None) or "ЛС" if reason == "dm" else getattr(msg.chat, "title", "Unknown")
-            
-            # Сохраняем в кэш и БД
-            entry = {
-                "cid": msg.chat.id, "mid": msg.message_id, "type": mtype,
-                "sender": sender_name, "title": chat_title, "text": content,
-                "file_id": file_id, "media_bytes": media_bytes, "saved_by_cmd": 1
-            }
-            mem_cache[owner_id].append(entry)
-            
-            await DB.cache_msg(
-                owner_id, msg.chat.id, msg.message_id,
-                sender_id, sender_name, chat_title, mtype,
-                content, file_id, media_bytes, ttl, view_once,
-                saved_by_cmd=1
-            )
-            
-            # Отправляем уведомление
-            if reason == "dm":
-                note = notif_saved_dm(sender_name, mtype)
-            else:
-                note = notif_saved_test(sender_name, chat_title, mtype)
-            
-            # Отправляем с медиа если есть
-            if media_bytes:
-                bif = BufferedInputFile(media_bytes, filename=f"saved_{msg.message_id}.dat")
-                try:
-                    if mtype == "photo":
-                        await _bot().send_photo(owner_id, bif, caption=note, parse_mode=ParseMode.HTML)
-                    elif mtype in ("video", "video_note"):
-                        await _bot().send_video(owner_id, bif, caption=note, parse_mode=ParseMode.HTML)
-                    elif mtype == "voice":
-                        await _bot().send_voice(owner_id, bif, caption=note, parse_mode=ParseMode.HTML)
-                    else:
-                        await _bot().send_document(owner_id, bif, caption=note, parse_mode=ParseMode.HTML)
-                    return
-                except Exception:
-                    pass
-            
-            await _bot().send_message(owner_id, note, parse_mode=ParseMode.HTML)
-            
-        except Exception as e:
-            log.error(f"save_message_to_cache err: {e}")
-
-    # Обработчик сообщений в ЛС боту
-    @r.message(F.chat.type == "private", ~F.text.startswith("/"))
-    async def handle_dm_save(msg: Message):
-        """v8.1: Сохранение ВСЕХ сообщений, отправленных боту в ЛС"""
-        save_enabled = await DB.get_config("save_dm_messages", "1")
-        if save_enabled != "1":
-            return
-        
-        user = await DB.get_user(msg.from_user.id)
-        if not user or not user["is_verified"]:
-            return
-        
-        # Проверяем активность плана
-        if not await DB.plan_active(msg.from_user.id):
-            return
-        
-        # Сохраняем сообщение
-        await save_message_to_cache(msg, msg.from_user.id, reason="dm")
-
-    # Обработчик реплаев с текстом "тест"
-    @r.message(F.reply_to_message, F.text.lower() == "тест")
-    async def handle_test_reply(msg: Message):
-        """v8.1: Сохранение сообщения, на которое реплаем с текстом 'тест'"""
-        save_enabled = await DB.get_config("save_test_replies", "1")
-        if save_enabled != "1":
-            return
-        
-        user = await DB.get_user(msg.from_user.id)
-        if not user or not user["is_verified"]:
-            return
-        
-        # Проверяем активность плана
-        if not await DB.plan_active(msg.from_user.id):
-            return
-        
-        # Сохраняем реплаенутое сообщение
-        await save_message_to_cache(msg.reply_to_message, msg.from_user.id, reason="test")
-        
-        # Удаляем команду "тест"
-        try:
-            await msg.delete()
-        except Exception:
-            pass
 
     # ── /start ────────────────────────────────────────────────────
 
@@ -1588,14 +1274,11 @@ def create_router(is_clone: bool = False,
                 f"1️⃣ Нажми кнопку ниже → попадёшь в приватный канал\n"
                 f"2️⃣ Нажми «Отправить заявку на вступление»\n"
                 f"3️⃣ Сразу возвращайся — бот автоматически тебя разблокирует\n\n"
-                f"<b>🎁 После верификации получишь {await DB.get_config('test_period_days', '3')} дня "
-                f"полного доступа ко всем функциям!</b>\n\n"
                 f"<i>⚡ Займёт ~10 секунд.</i>{POWERED_BY}",
                 reply_markup=ikb_url(
                     [("✅ Пройти верификацию", CAPTCHA_CHANNEL)],
                     [("📜 Условия использования", "terms")],
                 ),
-                parse_mode=ParseMode.HTML
             )
             return
 
@@ -1603,57 +1286,27 @@ def create_router(is_clone: bool = False,
             await msg.answer("🚫 Ваш аккаунт заблокирован.")
             return
 
-        # v8.1: Автоматическая проверка канала при старте
-        await check_channel_membership(_bot(), u.id)
-        user = await DB.get_user(u.id)  # Обновляем данные
-        
-        if user["channel_left"]:
-            await msg.answer(
-                f"❌ <b>Вы покинули канал верификации!</b>\n\n"
-                f"Для продолжения работы вступите обратно:\n{CAPTCHA_CHANNEL}\n\n"
-                f"После вступления нажмите /start снова",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ikb_url([("✅ Вернуться в канал", CAPTCHA_CHANNEL)])
-            )
-            return
-
         await _show_main(msg, user, POWERED_BY)
 
     async def _show_main(msg: Message, user: dict, powered: str = ""):
         active = await DB.plan_active(user["user_id"])
         plan   = user["plan"]
-        
-        # v8.1: Показываем trial отдельно
-        if plan == "trial" and not user["trial_used"]:
-            exp = fmt_exp(user["trial_expires"])
-            plan_text = f"🎁 <b>Тестовый период</b>"
-        else:
-            exp = fmt_exp(user["plan_expires"])
-            plan_text = f"{plan_emoji(plan)} <b>План:</b> {plan.upper()}"
-        
-        mode = user["mode"]
-        mon  = "🟢 Вкл" if user["monitoring_on"] else "🔴 Выкл"
+        exp    = fmt_exp(user["plan_expires"])
+        mode   = user["mode"]
+        mon    = "🟢 Вкл" if user["monitoring_on"] else "🔴 Выкл"
 
         text = (
             f"🌟 <b>MerAi &amp; Monitoring</b>\n\n"
             f"👋 Привет, <b>{h(user['first_name'] or '—')}</b>!\n\n"
             f"<b>📋 Твой аккаунт:</b>\n"
             f"├ 🆔 ID: <code>{user['user_id']}</code>\n"
-            f"├ {plan_text}\n"
+            f"├ {plan_emoji(plan)} <b>План:</b> {plan.upper()}\n"
             f"├ 📅 <b>До:</b> {exp if active else '—'}\n"
             f"├ 🔄 <b>Режим:</b> {'🤖 Bot' if mode=='chatbot' else '👤 Userbot' if mode=='userbot' else '❌ Не выбран'}\n"
             f"└ 📡 <b>Мониторинг:</b> {mon}\n\n"
+            f"{'✅ <b>Подписка активна</b>' if active else '⚠️ <b>Подписки нет</b> — купи план для старта'}"
+            f"{powered}"
         )
-        
-        if plan == "trial" and not user["trial_used"]:
-            text += "🎁 <b>Тестовый период активен!</b> Все функции доступны.\n"
-        elif active:
-            text += "✅ <b>Подписка активна</b>\n"
-        else:
-            text += "⚠️ <b>Подписки нет</b> — купи план для старта\n"
-        
-        text += powered
-        
         markup = ikb(
             [("⚙️ Режим работы", "mode"), ("💎 Тарифы", "plans")],
             [("📊 Мой профиль", "profile"), ("🎁 Рефералы", "referrals")],
@@ -1665,7 +1318,7 @@ def create_router(is_clone: bool = False,
             markup.inline_keyboard.append(
                 [InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin")]
             )
-        await msg.answer(text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        await msg.answer(text, reply_markup=markup)
 
     # ── Inline query ─────────────────────────────────────────────
 
@@ -1701,14 +1354,11 @@ def create_router(is_clone: bool = False,
             user = await DB.get_user(uid)
             if not user["is_verified"]:
                 await DB.verify(uid)
-            test_days = await DB.get_config("test_period_days", "3")
             await _bot().send_message(
                 uid,
-                f"✅ <b>Верификация пройдена!</b>\n\n"
-                f"🎁 Тебе доступен <b>{test_days}-дневный тестовый период</b> "
-                f"с полным функционалом!\n\n"
-                f"Добро пожаловать в MerAi &amp; Monitoring!\n"
-                f"Нажми /start для продолжения.",
+                "✅ <b>Верификация пройдена!</b>\n\n"
+                "Добро пожаловать в MerAi &amp; Monitoring!\n"
+                "Нажми /start для продолжения.",
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
@@ -1733,19 +1383,20 @@ def create_router(is_clone: bool = False,
 
     @r.callback_query(F.data == "toggle_monitor")
     async def _toggle_monitor(q: CallbackQuery):
-        # v8.1: Проверка через verify_and_check_channel
-        can_proceed, error_msg = await verify_and_check_channel(q.from_user.id)
-        if not can_proceed:
-            await q.answer(error_msg, show_alert=True)
-            return
-        
         user = await DB.get_user(q.from_user.id)
         if not user:
             await q.answer(); return
-        
+        active = await DB.plan_active(q.from_user.id)
+        if not active:
+            await q.answer("❌ Нужна активная подписка!", show_alert=True); return
+        # Проверяем членство в канале
+        if not user["channel_member"]:
+            in_chan = await check_channel_membership(_bot(), q.from_user.id)
+            if not in_chan:
+                await q.answer("❌ Пройди верификацию через канал!", show_alert=True); return
+            await DB.set_field(q.from_user.id, "channel_member", 1)
         new_state = 0 if user["monitoring_on"] else 1
         await DB.set_field(q.from_user.id, "monitoring_on", new_state)
-        
         if new_state and user["mode"] == "userbot" and user["ub_session"]:
             if q.from_user.id not in ub_clients:
                 api_id   = user["pyro_api_id"] or PYRO_API_ID
@@ -1756,144 +1407,7 @@ def create_router(is_clone: bool = False,
                     )
         if not new_state and user["mode"] == "userbot":
             asyncio.create_task(stop_userbot(q.from_user.id))
-        
         await q.answer(f"Мониторинг {'включён 🟢' if new_state else 'выключен 🔴'}", show_alert=True)
-
-    # ══════════════════════════════════════════════════════════════
-    #  v8.1: INLINE-КЛАВИАТУРА ДЛЯ USERBOT АВТОРИЗАЦИИ
-    # ══════════════════════════════════════════════════════════════
-
-    # Обработчик нажатий на numpad
-    @r.callback_query(F.data.startswith("numpad_"))
-    async def handle_numpad(q: CallbackQuery):
-        """v8.1: Обработка ввода через inline-клавиатуру"""
-        parts = q.data.split("_")  # numpad_{purpose}_{action}
-        if len(parts) < 3:
-            await q.answer(); return
-        
-        purpose = parts[1]  # 'code' или 'password'
-        action = parts[2]
-        
-        data = ub_auth_data.get(q.from_user.id)
-        if not data:
-            await q.answer("⏱ Сессия истекла, начните заново", show_alert=True)
-            return
-        
-        current = data.get(purpose, "")
-        
-        # Обработка действий
-        if action == "display":
-            await q.answer()
-            return
-        elif action == "back":
-            # Удалить последний символ
-            current = current[:-1]
-        elif action == "submit":
-            # Отправка кода/пароля
-            if not current:
-                await q.answer("Введите значение!", show_alert=True)
-                return
-            
-            data[purpose] = current
-            
-            if purpose == "code":
-                # Пытаемся авторизоваться
-                await q.message.edit_text("⏳ Проверяю код…")
-                result = await ub_sign_in(q.from_user.id)
-                
-                if result == "NEED_2FA":
-                    data["password"] = ""
-                    await q.message.edit_text(
-                        "🔒 <b>Требуется 2FA пароль</b>\n\nВведите пароль через клавиатуру:",
-                        reply_markup=inline_numpad("", "password"),
-                        parse_mode=ParseMode.HTML
-                    )
-                elif result:
-                    await _ub_auth_success(q.message, result)
-                else:
-                    await q.message.edit_text(
-                        "❌ Неверный код!\n\nПопробуйте ещё раз:",
-                        reply_markup=inline_numpad("", "code")
-                    )
-                    data["code"] = ""
-            else:  # password
-                # Пытаемся авторизоваться с паролем
-                await q.message.edit_text("⏳ Проверяю пароль…")
-                result = await ub_sign_in(q.from_user.id)
-                
-                if result and result != "NEED_2FA":
-                    await _ub_auth_success(q.message, result)
-                else:
-                    await q.message.edit_text(
-                        "❌ Неверный пароль 2FA!\n\nПопробуйте ещё раз:",
-                        reply_markup=inline_numpad("", "password")
-                    )
-                    data["password"] = ""
-            return
-        else:
-            # Добавить цифру
-            if len(current) < 10:  # Максимум 10 символов
-                current += action
-        
-        # Обновляем клавиатуру
-        data[purpose] = current
-        try:
-            await q.message.edit_reply_markup(
-                reply_markup=inline_numpad(current, purpose)
-            )
-        except Exception:
-            pass
-        await q.answer()
-
-    @r.callback_query(F.data == "ub_cancel_auth")
-    async def handle_ub_cancel(q: CallbackQuery):
-        """Отмена авторизации userbot"""
-        if q.from_user.id in ub_auth_data:
-            try:
-                await ub_auth_data[q.from_user.id]["client"].stop()
-            except Exception:
-                pass
-            del ub_auth_data[q.from_user.id]
-        
-        await q.message.edit_text(
-            "❌ Авторизация отменена",
-            reply_markup=ikb([("🏠 Меню", "back_main")])
-        )
-        await q.answer()
-
-    async def _ub_auth_success(msg: Message, session: str):
-        """Успешная авторизация userbot"""
-        uid = msg.chat.id
-        await DB.set_field(uid, "ub_session", session)
-        await DB.set_field(uid, "ub_active", 1)
-        await DB.set_field(uid, "mode", "userbot")
-        
-        user     = await DB.get_user(uid)
-        api_id   = user["pyro_api_id"] or PYRO_API_ID
-        api_hash = user["pyro_api_hash"] or PYRO_API_HASH
-        ok = False
-        if api_id and api_hash:
-            ok = await start_userbot(uid, session, api_id, api_hash)
-        
-        if ok:
-            await msg.edit_text(
-                "✅ <b>Userbot подключён!</b>\n\n"
-                "Включи мониторинг кнопкой в главном меню.\n"
-                "Перехватываются:\n"
-                "• Удалённые сообщения\n"
-                "• Редактирования\n"
-                "• Исчезающие 💣 и «один просмотр» 👁\n"
-                "• Видео-кружки ⭕ и голосовые 🎙\n"
-                "• Фото, видео, файлы",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ikb([("🏠 Меню", "back_main")]),
-            )
-        else:
-            await msg.edit_text(
-                "⚠️ Сессия сохранена, но userbot не запустился.\n"
-                "Попробуй включить мониторинг вручную.",
-                reply_markup=ikb([("🏠 Меню", "back_main")]),
-            )
 
     # ── Режимы ────────────────────────────────────────────────────
 
@@ -1921,11 +1435,9 @@ def create_router(is_clone: bool = False,
 
     @r.callback_query(F.data == "set_mode_bot")
     async def _set_mode_bot(q: CallbackQuery):
-        can_proceed, error_msg = await verify_and_check_channel(q.from_user.id)
-        if not can_proceed:
-            await q.answer(error_msg, show_alert=True)
-            return
-        
+        active = await DB.plan_active(q.from_user.id)
+        if not active:
+            await q.answer("❌ Нужна активная подписка!", show_alert=True); return
         await DB.set_field(q.from_user.id, "mode", "chatbot")
         await q.message.edit_text(
             f"🤖 <b>Bot Mode — Telegram Business Chatbot</b>\n\n"
@@ -1964,15 +1476,11 @@ def create_router(is_clone: bool = False,
 
     @r.callback_query(F.data == "set_mode_ub")
     async def _set_mode_ub(q: CallbackQuery, state: FSMContext):
-        can_proceed, error_msg = await verify_and_check_channel(q.from_user.id)
-        if not can_proceed:
-            await q.answer(error_msg, show_alert=True)
-            return
-        
+        active = await DB.plan_active(q.from_user.id)
+        if not active:
+            await q.answer("❌ Нужна активная подписка!", show_alert=True); return
         if not PYROGRAM_OK:
-            await q.answer("⚠️ Pyrogram не установлен на сервере", show_alert=True)
-            return
-        
+            await q.answer("⚠️ Pyrogram не установлен на сервере", show_alert=True); return
         user = await DB.get_user(q.from_user.id)
         if user.get("ub_session"):
             status = "🟢 Активен" if q.from_user.id in ub_clients else "🔴 Остановлен"
@@ -1988,7 +1496,6 @@ def create_router(is_clone: bool = False,
                 ),
             )
             await q.answer(); return
-        
         await q.message.edit_text(
             "👤 <b>Userbot Mode — Полный мониторинг</b>\n\n"
             "<b>Требования:</b>\n"
@@ -2019,7 +1526,7 @@ def create_router(is_clone: bool = False,
     @r.callback_query(F.data == "ub_start_fsm")
     async def _ub_start_fsm(q: CallbackQuery, state: FSMContext):
         await q.message.edit_text(
-            "👤 <b>Шаг 1/3:</b> Введи <b>api_id</b>\n"
+            "👤 <b>Шаг 1/4:</b> Введи <b>api_id</b>\n"
             "(число с my.telegram.org/apps):",
             parse_mode=ParseMode.HTML,
             reply_markup=ikb([("❌ Отмена", "back_main")]),
@@ -2033,7 +1540,7 @@ def create_router(is_clone: bool = False,
         await DB.set_field(q.from_user.id, "ub_active", 0)
         asyncio.create_task(stop_userbot(q.from_user.id))
         await q.message.edit_text(
-            "👤 <b>Шаг 1/3:</b> Введи <b>api_id</b>\n"
+            "👤 <b>Шаг 1/4:</b> Введи <b>api_id</b>\n"
             "(число с my.telegram.org/apps):",
             parse_mode=ParseMode.HTML,
             reply_markup=ikb([("❌ Отмена", "back_main")]),
@@ -2055,7 +1562,7 @@ def create_router(is_clone: bool = False,
         except Exception:
             pass
 
-    # ── FSM: Userbot (v8.1 - с inline-клавиатурой) ────────────────
+    # ── FSM: Userbot ──────────────────────────────────────────────
 
     @r.message(StateFilter(UserBotSt.api_id))
     async def _ub_api_id(msg: Message, state: FSMContext):
@@ -2067,7 +1574,7 @@ def create_router(is_clone: bool = False,
         await state.update_data(api_id=api_id)
         await DB.set_field(msg.from_user.id, "pyro_api_id", api_id)
         await msg.answer(
-            "👤 <b>Шаг 2/3:</b> Введи <b>api_hash</b>\n"
+            "👤 <b>Шаг 2/4:</b> Введи <b>api_hash</b>\n"
             "(строка из букв и цифр с my.telegram.org/apps):",
             parse_mode=ParseMode.HTML,
         )
@@ -2081,7 +1588,7 @@ def create_router(is_clone: bool = False,
         await state.update_data(api_hash=api_hash)
         await DB.set_field(msg.from_user.id, "pyro_api_hash", api_hash)
         await msg.answer(
-            "👤 <b>Шаг 3/3:</b> Введи номер телефона\n"
+            "👤 <b>Шаг 3/4:</b> Введи номер телефона\n"
             "Формат: <code>+79991234567</code>",
             parse_mode=ParseMode.HTML,
         )
@@ -2095,34 +1602,85 @@ def create_router(is_clone: bool = False,
                 "❌ Неверный формат. Введи: <code>+79991234567</code>",
                 parse_mode=ParseMode.HTML,
             ); return
-        
         data = await state.get_data()
         api_id   = data.get("api_id") or PYRO_API_ID
         api_hash = data.get("api_hash") or PYRO_API_HASH
-        
-        notice = await msg.answer("⏳ Отправляю код…")
+        await msg.answer("⏳ Отправляю код…")
         ph_hash = await ub_send_code(msg.from_user.id, phone, api_id, api_hash)
-        
         if not ph_hash:
-            await notice.edit_text(
+            await msg.answer(
                 "❌ Не удалось отправить код. Проверь api_id/api_hash или номер.",
                 reply_markup=ikb([("🔙 Меню", "back_main")]),
             )
             await state.clear(); return
-        
         await state.update_data(phone=phone)
         await DB.set_field(msg.from_user.id, "ub_phone", phone)
-        await state.clear()
-        
-        # v8.1: Показываем inline-клавиатуру для ввода кода
-        await notice.edit_text(
-            f"📱 <b>Код отправлен на {phone}</b>\n\n"
-            f"Введи код из Telegram (или SMS) через клавиатуру ниже.\n\n"
-            f"<b>🔒 Безопасный ввод через кнопки</b>\n"
-            f"(Telegram не увидит код в чате)",
-            reply_markup=inline_numpad("", "code"),
-            parse_mode=ParseMode.HTML
+        await msg.answer(
+            f"📱 Код отправлен на <code>{phone}</code>\n\n"
+            f"<b>Шаг 4/4:</b> Введи код из Telegram (или SMS):",
+            parse_mode=ParseMode.HTML,
         )
+        await state.set_state(UserBotSt.code)
+
+    @r.message(StateFilter(UserBotSt.code))
+    async def _ub_code(msg: Message, state: FSMContext):
+        code = msg.text.strip().replace(" ", "").replace("-", "")
+        await msg.answer("⏳ Проверяю код…")
+        result = await ub_sign_in(msg.from_user.id, code)
+        if result == "NEED_2FA":
+            await msg.answer("🔒 Нужен пароль 2FA:\nВведи пароль:")
+            await state.set_state(UserBotSt.twofa); return
+        if not result:
+            await msg.answer(
+                "❌ Неверный код. Попробуй ещё раз:",
+                reply_markup=ikb([("🔄 Заново", "ub_reconnect"), ("🔙 Меню", "back_main")])
+            )
+            await state.clear(); return
+        await _ub_success(msg, state, result)
+
+    @r.message(StateFilter(UserBotSt.twofa))
+    async def _ub_twofa(msg: Message, state: FSMContext):
+        if msg.from_user.id not in ub_auth_data:
+            await msg.answer("⏱ Сессия истекла. Начни заново.",
+                             reply_markup=ikb([("🔄 Заново", "ub_reconnect")]))
+            await state.clear(); return
+        result = await ub_sign_in(msg.from_user.id, "", password=msg.text.strip())
+        if not result or result == "NEED_2FA":
+            await msg.answer("❌ Неверный пароль 2FA. Попробуй ещё раз:"); return
+        await _ub_success(msg, state, result)
+
+    async def _ub_success(msg: Message, state: FSMContext, session: str):
+        uid = msg.from_user.id
+        await DB.set_field(uid, "ub_session", session)
+        await DB.set_field(uid, "ub_active", 1)
+        await DB.set_field(uid, "mode", "userbot")
+        await state.clear()
+        data     = await state.get_data()
+        user     = await DB.get_user(uid)
+        api_id   = user["pyro_api_id"] or PYRO_API_ID
+        api_hash = user["pyro_api_hash"] or PYRO_API_HASH
+        ok = False
+        if api_id and api_hash:
+            ok = await start_userbot(uid, session, api_id, api_hash)
+        if ok:
+            await msg.answer(
+                "✅ <b>Userbot подключён!</b>\n\n"
+                "Включи мониторинг кнопкой в главном меню.\n"
+                "Перехватываются:\n"
+                "• Удалённые сообщения\n"
+                "• Редактирования\n"
+                "• Исчезающие 💣 и «один просмотр» 👁\n"
+                "• Видео-кружки ⭕ и голосовые 🎙\n"
+                "• Фото, видео, файлы",
+                parse_mode=ParseMode.HTML,
+                reply_markup=ikb([("🏠 Меню", "back_main")]),
+            )
+        else:
+            await msg.answer(
+                "⚠️ Сессия сохранена, но userbot не запустился.\n"
+                "Попробуй включить мониторинг вручную.",
+                reply_markup=ikb([("🏠 Меню", "back_main")]),
+            )
 
     # ── Планы и оплата ───────────────────────────────────────────
 
@@ -2131,13 +1689,8 @@ def create_router(is_clone: bool = False,
     async def _cb_plans(upd):
         q = upd if isinstance(upd, CallbackQuery) else None
         msg_obj = q.message if q else upd
-        
-        test_days = await DB.get_config("test_period_days", "3")
-        
         text = (
             "💎 <b>Тарифные планы MerAi</b>\n\n"
-            f"🎁 <b>Тестовый период:</b> {test_days} дня бесплатно\n"
-            "Все функции доступны сразу после верификации!\n\n"
             "Оплата — <b>Telegram Stars ⭐</b>\n\n"
         )
         for pid, p in PLANS.items():
@@ -2148,9 +1701,7 @@ def create_router(is_clone: bool = False,
             "• Bot Mode (Telegram Business)\n"
             "• Userbot Mode (полный перехват)\n"
             "• Клонирование ботов (+3 дня за каждый)\n"
-            "• ZIP-архив при массовых удалениях\n"
-            "• Сохранение сообщений в ЛС боту\n"
-            "• Команда 'тест' для сохранения любых сообщений"
+            "• ZIP-архив при массовых удалениях"
         )
         rows = [[
             (f"{plan_emoji(pid)} {p['name']} — {p['stars']} ⭐", f"buy_{pid}")
@@ -2165,12 +1716,6 @@ def create_router(is_clone: bool = False,
 
     @r.callback_query(F.data.startswith("buy_"))
     async def _cb_buy(q: CallbackQuery):
-        # v8.1: Проверка перед покупкой
-        can_proceed, error_msg = await verify_and_check_channel(q.from_user.id)
-        if not can_proceed:
-            await q.answer(error_msg, show_alert=True)
-            return
-        
         plan_id = q.data[4:]
         plan    = PLANS.get(plan_id)
         if not plan:
@@ -2228,20 +1773,15 @@ def create_router(is_clone: bool = False,
         clones = await DB.get_user_clones(q.from_user.id)
         stats  = await DB.get_deletion_stats(q.from_user.id)
         ref_link = f"https://t.me/{BOT_USERNAME}?start=ref{u['user_id']}"
-        
-        # v8.1: Показываем trial отдельно
-        if u["plan"] == "trial" and not u["trial_used"]:
-            plan_status = f"🎁 Тестовый период\n├ 📅 До: {fmt_exp(u['trial_expires'])}"
-        else:
-            plan_status = f"{plan_emoji(u['plan'])} {u['plan'].upper()}\n├ {'✅ Активна' if active else '❌ Истекла'}\n├ 📅 До: {fmt_exp(u['plan_expires'])}"
-        
         text = (
             f"📊 <b>Мой профиль</b>\n\n"
             f"🆔 ID: <code>{u['user_id']}</code>\n"
             f"👤 Имя: {h(u['first_name'] or '—')}\n"
             f"🔗 Username: @{u['username'] or '—'}\n\n"
             f"<b>Подписка:</b>\n"
-            f"├ {plan_status}\n\n"
+            f"├ {plan_emoji(u['plan'])} {u['plan'].upper()}\n"
+            f"├ {'✅ Активна' if active else '❌ Истекла'}\n"
+            f"└ 📅 До: {fmt_exp(u['plan_expires'])}\n\n"
             f"<b>Статистика:</b>\n"
             f"├ 🗑 Перехвачено: {stats['total']}\n"
             f"├ 🤖 Клонов ботов: {len(clones)}\n"
@@ -2285,11 +1825,10 @@ def create_router(is_clone: bool = False,
     @r.callback_query(F.data == "my_clones")
     async def _my_clones(q: CallbackQuery):
         clones = await DB.get_user_clones(q.from_user.id)
-        bonus = await DB.get_config("clone_bonus_days", "3")
         if not clones:
             await q.message.edit_text(
                 "🤖 <b>Клонированные боты</b>\n\nУ тебя нет подключённых ботов.\n"
-                f"Добавь бот и получи +{bonus} дня к подписке!",
+                f"Добавь бот и получи +{CLONE_BONUS_DAYS} дня к подписке!",
                 parse_mode=ParseMode.HTML,
                 reply_markup=ikb([("➕ Добавить бот", "clone_start"), ("🔙 Профиль", "profile")]),
             )
@@ -2335,11 +1874,9 @@ def create_router(is_clone: bool = False,
 
     @r.callback_query(F.data == "clone_start")
     async def _clone_start(q: CallbackQuery, state: FSMContext):
-        can_proceed, error_msg = await verify_and_check_channel(q.from_user.id)
-        if not can_proceed:
-            await q.answer(error_msg, show_alert=True)
-            return
-        
+        active = await DB.plan_active(q.from_user.id)
+        if not active:
+            await q.answer("❌ Нужна активная подписка!", show_alert=True); return
         bonus = int(await DB.get_config("clone_bonus_days", str(CLONE_BONUS_DAYS)))
         await q.message.edit_text(
             f"🤖 <b>Клонирование бота</b>\n\n"
@@ -2389,6 +1926,7 @@ def create_router(is_clone: bool = False,
 
         await DB.add_days(uid, bonus)
 
+        # Получаем clone_id
         clones = await DB.get_user_clones(uid)
         this_clone = next((c for c in clones if c["bot_token"] == token), None)
         cid_db = this_clone["id"] if this_clone else None
@@ -2438,8 +1976,10 @@ def create_router(is_clone: bool = False,
 
     @r.message(StateFilter(SupportSt.message))
     async def _support_msg(msg: Message, state: FSMContext):
+        # Проверяем, нет ли это ответа admin (контекст reply)
         data = await state.get_data()
         if data.get("reply_tid"):
+            # Это ответ admin'а на тикет
             tid     = data["reply_tid"]
             uid_to  = data["reply_uid"]
             txt     = msg.text or "[медиа]"
@@ -2482,7 +2022,7 @@ def create_router(is_clone: bool = False,
         except Exception:
             pass
 
-    # ── Условия, Помощь ───────────────────────────────────────────
+    # ── Условия, Помощь, команды ─────────────────────────────────
 
     @r.callback_query(F.data == "terms")
     @r.message(Command("terms"))
@@ -2501,15 +2041,8 @@ def create_router(is_clone: bool = False,
     async def _help(upd):
         q = upd if isinstance(upd, CallbackQuery) else None
         msg_obj = q.message if q else upd
-        test_days = await DB.get_config("test_period_days", "3")
         text = (
-            "❓ <b>Справка MerAi &amp; Monitoring v8.1</b>\n\n"
-            f"<b>🎁 НОВИНКИ версии 8.1 (10.03.2026):</b>\n"
-            f"• Тестовый период {test_days} дня с полным функционалом\n"
-            f"• Сохранение ЛЮБЫХ сообщений в ЛС боту\n"
-            f"• Команда 'тест' - реплай на сообщение для сохранения\n"
-            f"• Безопасный ввод кода userbot через кнопки\n"
-            f"• Автопроверка канала перед каждым действием\n\n"
+            "❓ <b>Справка MerAi &amp; Monitoring</b>\n\n"
             "<b>Команды:</b>\n"
             "/start — Главное меню\n"
             "/plan — Тарифные планы\n"
@@ -2526,8 +2059,6 @@ def create_router(is_clone: bool = False,
             "Один просмотр 👁       | ❌ | ✅\n"
             "Личные переписки       | ❌ | ✅\n"
             "ZIP-архив              | ✅ | ✅\n"
-            "Сохранение в ЛС        | ✅ | ✅\n"
-            "Команда 'тест'         | ✅ | ✅\n"
             "Нужен Premium          | ✅ | ❌\n"
             "Нужен API ключ         | ❌ | ✅"
         )
@@ -2538,9 +2069,7 @@ def create_router(is_clone: bool = False,
         else:
             await msg_obj.answer(text, parse_mode=ParseMode.HTML)
 
-    # ══════════════════════════════════════════════════════════════
-    #  ADMIN ПАНЕЛЬ (v8.1 - расширенная)
-    # ══════════════════════════════════════════════════════════════
+    # ── Admin ─────────────────────────────────────────────────────
 
     @r.message(Command("admin"))
     async def _cmd_admin(msg: Message):
@@ -2573,11 +2102,10 @@ def create_router(is_clone: bool = False,
     async def _admin_main(msg: Message):
         s = await DB.stats()
         text = (
-            f"🛠 <b>Админ-панель MerAi v8.1</b>\n"
+            f"🛠 <b>Админ-панель MerAi</b>\n"
             f"{'═'*28}\n"
             f"👥 Всего пользователей: {s['total']}\n"
             f"✅ Верифицировано: {s['verified']}\n"
-            f"🎁 На тестовом периоде: {s['trial']}\n"
             f"💎 Платящих: {s['paid']}\n"
             f"🤖 Клонов активных: {s['clones']}\n"
             f"👤 Userbot сессий: {len(ub_clients)}\n"
@@ -2598,10 +2126,9 @@ def create_router(is_clone: bool = False,
             await q.answer(); return
         s = await DB.stats()
         text = (
-            f"📊 <b>Полная статистика v8.1</b>\n\n"
+            f"📊 <b>Полная статистика</b>\n\n"
             f"👥 Всего: {s['total']}\n"
             f"✅ Верифиц.: {s['verified']}\n"
-            f"🎁 Trial: {s['trial']}\n"
             f"💎 Платящих: {s['paid']}\n"
             f"🤖 Клонов: {s['clones']}\n"
             f"⭐ Stars: {s['stars']}\n"
@@ -2615,55 +2142,527 @@ def create_router(is_clone: bool = False,
         ))
         await q.answer()
 
-    # ... Остальные админ-функции (пользователи, клоны, тикеты, рассылка) ...
-    # Для экономии места оставляю их такими же, как в оригинале
-    # Добавлю только расширенный конфиг:
+    # ── Список пользователей ──────────────────────────────────────
+
+    @r.callback_query(F.data.startswith("adm_users_p"))
+    async def _adm_users(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        page = int(q.data.split("p")[-1])
+        per  = 6
+        all_u = await DB.all_users()
+        total = len(all_u)
+        chunk = all_u[(page - 1) * per: page * per]
+        text  = f"<b>👥 Пользователи</b> (стр.{page}, всего {total})\n\n"
+        rows  = []
+        for u in chunk:
+            act = "✅" if await DB.plan_active(u["user_id"]) else "❌"
+            ban = "🚫" if u["is_banned"] else ""
+            nm  = h((u["first_name"] or u["username"] or str(u["user_id"]))[:18])
+            text += f"{act}{ban} <code>{u['user_id']}</code> {nm} [{u['plan']}]\n"
+            rows.append([(f"👤 {nm[:14]}", f"adm_u_{u['user_id']}")])
+        nav = []
+        if page > 1:          nav.append(("◀", f"adm_users_p{page-1}"))
+        if page * per < total: nav.append(("▶", f"adm_users_p{page+1}"))
+        if nav: rows.append(nav)
+        rows.append([("🔙 Панель", "adm_back")])
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=ikb(*rows))
+        await q.answer()
+
+    @r.callback_query(F.data.startswith("adm_u_"))
+    async def _adm_user_detail(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        uid    = int(q.data[6:])
+        u      = await DB.get_user(uid)
+        if not u:
+            await q.answer("Не найден", show_alert=True); return
+        active = await DB.plan_active(uid)
+        clones = await DB.get_user_clones(uid)
+        stats  = await DB.get_deletion_stats(uid)
+        ub_on  = uid in ub_clients
+        text = (
+            f"<b>👤 Пользователь</b>\n\n"
+            f"🆔 <code>{uid}</code>\n"
+            f"📛 {h(u['first_name'] or '—')} (@{u['username'] or '—'})\n"
+            f"📦 План: {u['plan'].upper()} {'✅' if active else '❌'}\n"
+            f"📅 До: {fmt_exp(u['plan_expires'])}\n"
+            f"🔄 Режим: {u['mode']}\n"
+            f"📡 Мониторинг: {'🟢' if u['monitoring_on'] else '🔴'}\n"
+            f"🖥 Business: {'✅' if u['biz_connected'] else '❌'}\n"
+            f"👤 Userbot: {'🟢 Активен' if ub_on else '🔴'}\n"
+            f"🚫 Бан: {'Да' if u['is_banned'] else 'Нет'}\n"
+            f"🤖 Клонов: {len(clones)}\n"
+            f"🗑 Перехвачено: {stats['total']}\n"
+            f"👥 Рефералов: {u['referral_count']}\n"
+        )
+        if stats["recent"]:
+            text += "\n<b>Последние удаления:</b>\n"
+            for row in stats["recent"][:5]:
+                ts   = (row["deleted_at"] or "")[:16]
+                mtyp = mtype_icon(row["msg_type"])
+                txt  = h((row["content"] or "")[:40])
+                text += f"• {ts} {mtyp} {txt}\n"
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=ikb(
+            [("📅 week", f"adm_sp_{uid}_week"), ("📆 month", f"adm_sp_{uid}_month")],
+            [("📊 quarter", f"adm_sp_{uid}_quarter"), ("🎯 year", f"adm_sp_{uid}_year")],
+            [("🆓 Убрать план", f"adm_sp_{uid}_free"), ("🚫 Бан/Разбан", f"adm_ban_{uid}")],
+            [("📡 Вкл/Выкл монит.", f"adm_mon_{uid}"), ("➕ Добавить дни", f"adm_days_{uid}")],
+            [("💬 Написать юзеру", f"adm_msg_{uid}"), ("🗑 История", f"adm_del_hist_{uid}")],
+            [("🤖 Клоны юзера", f"adm_ub_{uid}"), ("🔙 Список", "adm_users_p1")],
+        ))
+        await q.answer()
+
+    @r.callback_query(F.data.startswith("adm_sp_"))
+    async def _adm_set_plan(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        parts   = q.data.split("_")  # adm_sp_{uid}_{plan}
+        uid     = int(parts[2])
+        plan_id = parts[3]
+        if plan_id == "free":
+            await DB.set_field(uid, "plan", "free")
+            await DB.set_field(uid, "plan_expires", None)
+        else:
+            p = PLANS.get(plan_id)
+            if p:
+                await DB.set_plan(uid, plan_id, p["days"])
+        try:
+            await _bot().send_message(
+                uid,
+                f"📦 Ваш план изменён администратором: <b>{plan_id.upper()}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        await q.answer(f"✅ Установлен план {plan_id}", show_alert=True)
+        # Обновляем карточку
+        q.data = f"adm_u_{uid}"
+        await _adm_user_detail(q)
+
+    @r.callback_query(F.data.startswith("adm_ban_"))
+    async def _adm_ban(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        uid = int(q.data[8:])
+        u   = await DB.get_user(uid)
+        nb  = 0 if (u and u["is_banned"]) else 1
+        await DB.set_field(uid, "is_banned", nb)
+        await q.answer("🚫 Забанен" if nb else "✅ Разбанен", show_alert=True)
+        q.data = f"adm_u_{uid}"
+        await _adm_user_detail(q)
+
+    @r.callback_query(F.data.startswith("adm_mon_"))
+    async def _adm_monitor(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        uid = int(q.data[8:])
+        u   = await DB.get_user(uid)
+        ns  = 0 if (u and u["monitoring_on"]) else 1
+        await DB.set_field(uid, "monitoring_on", ns)
+        await q.answer(f"Мониторинг {'вкл' if ns else 'выкл'}", show_alert=True)
+        q.data = f"adm_u_{uid}"
+        await _adm_user_detail(q)
+
+    @r.callback_query(F.data.startswith("adm_days_"))
+    async def _adm_days_start(q: CallbackQuery, state: FSMContext):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        uid = int(q.data[9:])
+        await state.update_data(target_uid=uid)
+        await q.message.edit_text(
+            f"➕ Добавить дни пользователю <code>{uid}</code>\n\nВведи количество дней:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ikb([("❌ Отмена", f"adm_u_{uid}")]),
+        )
+        await state.set_state(AdminSt.add_days_amt)
+        await q.answer()
+
+    @r.message(StateFilter(AdminSt.add_days_amt))
+    async def _adm_days_recv(msg: Message, state: FSMContext):
+        if msg.from_user.id != ADMIN_ID: return
+        try:
+            days = int(msg.text.strip())
+            assert 1 <= days <= 3650
+        except Exception:
+            await msg.answer("❌ Введи число от 1 до 3650"); return
+        data = await state.get_data()
+        uid  = data.get("target_uid")
+        await DB.add_days(uid, days)
+        await state.clear()
+        try:
+            await _bot().send_message(
+                uid,
+                f"🎁 Администратор добавил <b>+{days} дней</b> к вашей подписке!",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        await msg.answer(f"✅ +{days} дней добавлено пользователю {uid}",
+                         reply_markup=ikb([("👤 Пользователь", f"adm_u_{uid}")]))
+
+    @r.callback_query(F.data.startswith("adm_msg_"))
+    async def _adm_msg_start(q: CallbackQuery, state: FSMContext):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        uid = int(q.data[8:])
+        await state.update_data(msg_uid=uid)
+        await q.message.edit_text(
+            f"💬 Сообщение пользователю <code>{uid}</code>\nВведи текст:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ikb([("❌ Отмена", f"adm_u_{uid}")]),
+        )
+        await state.set_state(AdminSt.broadcast_single)
+        await q.answer()
+
+    @r.callback_query(F.data.startswith("adm_del_hist_"))
+    async def _adm_del_hist(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        uid  = int(q.data[13:])
+        hist = await DB.get_user_deletion_history(uid, 15)
+        text = f"🗑 <b>История удалений — {uid}</b>\n\n"
+        for row in hist:
+            ts   = (row["deleted_at"] or "")[:16]
+            mtyp = mtype_icon(row["msg_type"])
+            chat = h((row["chat_title"] or "")[:20])
+            cnt  = h((row["content"] or "")[:30])
+            text += f"• {ts} {mtyp} {chat}: {cnt}\n"
+        if not hist:
+            text += "Нет записей."
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=ikb(
+            [("🔙 Пользователь", f"adm_u_{uid}")]
+        ))
+        await q.answer()
+
+    @r.callback_query(F.data.startswith("adm_ub_"))
+    async def _adm_user_clones(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        uid    = int(q.data[7:])
+        clones = await DB.get_user_clones(uid)
+        text   = f"<b>🤖 Клоны пользователя {uid}</b>\n\n"
+        rows   = []
+        for c in clones:
+            run = "🟢" if c["bot_token"] in clone_bots else "🔴"
+            text += f"{run} @{c['bot_username'] or '?'} — {h(c['bot_name'] or '?')}\n"
+            lbl  = "🔴 Стоп" if c["bot_token"] in clone_bots else "🟢 Запуск"
+            rows.append([(f"{lbl} @{c['bot_username']}", f"adm_ctog_{c['id']}")])
+        if not clones:
+            text += "Нет клонов."
+        rows.append([("🔙 Пользователь", f"adm_u_{uid}")])
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=ikb(*rows))
+        await q.answer()
+
+    @r.callback_query(F.data.startswith("adm_ctog_"))
+    async def _adm_clone_toggle(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        cid_db = int(q.data[9:])
+        async with DB._conn.execute(
+            "SELECT * FROM cloned_bots WHERE id=?", (cid_db,)
+        ) as c:
+            row = await c.fetchone()
+        if not row:
+            await q.answer("Не найден", show_alert=True); return
+        token    = row["bot_token"]
+        owner_id = row["owner_id"]
+        if token in clone_bots:
+            asyncio.create_task(stop_clone(token))
+            await DB._conn.execute(
+                "UPDATE cloned_bots SET is_active=0 WHERE id=?", (cid_db,)
+            )
+            await q.answer("🔴 Остановлен", show_alert=True)
+        else:
+            asyncio.create_task(launch_clone(token, owner_id, cid_db))
+            await DB._conn.execute(
+                "UPDATE cloned_bots SET is_active=1 WHERE id=?", (cid_db,)
+            )
+            await q.answer("🟢 Запущен", show_alert=True)
+        await DB._conn.commit()
+
+    # ── Клоны (admin список) ──────────────────────────────────────
+
+    @r.callback_query(F.data == "adm_clones_list")
+    async def _adm_clones_list(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        clones = await DB.all_clones()
+        text   = f"<b>🤖 Клонированные боты ({len(clones)} всего)</b>\n\n"
+        rows   = []
+        for c in clones:
+            run = "🟢" if c["bot_token"] in clone_bots else "🔴"
+            short_token = c["bot_token"][:20] + "…"
+            text += (
+                f"{run} @{c['bot_username'] or '?'} — owner: {c['owner_id']}\n"
+                f"Токен: <code>{short_token}</code>\n"
+                f"Юзеров: {c['user_count']} | Добавлен: {(c['added_at'] or '')[:10]}\n\n"
+            )
+            rows.append([
+                (f"{run} @{c['bot_username'] or '?'}", f"adm_ctog_{c['id']}"),
+                (f"👥 Юзеры", f"adm_clone_users_{c['id']}"),
+            ])
+            rows.append([
+                (f"📢 Рассылка", f"adm_clone_bc_{c['id']}"),
+                (f"🗑 Удалить", f"adm_clone_del_{c['id']}"),
+            ])
+        rows.append([("🔙 Панель", "adm_back")])
+        await q.message.edit_text(text[:4000], parse_mode=ParseMode.HTML, reply_markup=ikb(*rows))
+        await q.answer()
+
+    @r.callback_query(F.data.startswith("adm_clone_users_"))
+    async def _adm_clone_users(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        cid_db = int(q.data[16:])
+        users  = await DB.get_clone_users(cid_db)
+        text   = f"<b>👥 Юзеры клона #{cid_db}</b>\n\n"
+        for u in users[:30]:
+            text += f"• <code>{u['user_id']}</code> {h(u['first_name'] or '—')} @{u['username'] or '—'}\n"
+        if not users:
+            text += "Нет юзеров."
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=ikb(
+            [("🔙 Клоны", "adm_clones_list")]
+        ))
+        await q.answer()
+
+    @r.callback_query(F.data.startswith("adm_clone_del_"))
+    async def _adm_clone_delete(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        cid_db = int(q.data[14:])
+        async with DB._conn.execute(
+            "SELECT bot_token FROM cloned_bots WHERE id=?", (cid_db,)
+        ) as c:
+            row = await c.fetchone()
+        if row:
+            asyncio.create_task(stop_clone(row["bot_token"]))
+        await DB._conn.execute("DELETE FROM cloned_bots WHERE id=?", (cid_db,))
+        await DB._conn.commit()
+        await q.answer("✅ Клон удалён", show_alert=True)
+        q.data = "adm_clones_list"
+        await _adm_clones_list(q)
+
+    @r.callback_query(F.data.startswith("adm_clone_bc_"))
+    async def _adm_clone_bc_start(q: CallbackQuery, state: FSMContext):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        cid_db = int(q.data[13:])
+        await state.update_data(bc_clone_id=cid_db)
+        await q.message.edit_text(
+            f"📢 Рассылка через клон #{cid_db}\n\nВведи текст:",
+            reply_markup=ikb([("❌ Отмена", "adm_clones_list")]),
+        )
+        await state.set_state(AdminSt.broadcast_clone)
+        await q.answer()
+
+    @r.message(StateFilter(AdminSt.broadcast_clone))
+    async def _adm_clone_bc_send(msg: Message, state: FSMContext):
+        if msg.from_user.id != ADMIN_ID: return
+        data   = await state.get_data()
+        cid_db = data.get("bc_clone_id")
+        text   = msg.text
+        await state.clear()
+        async with DB._conn.execute(
+            "SELECT bot_token FROM cloned_bots WHERE id=?", (cid_db,)
+        ) as c:
+            row = await c.fetchone()
+        if not row or row["bot_token"] not in clone_bots:
+            await msg.answer("❌ Клон не запущен."); return
+        clone_b = clone_bots[row["bot_token"]][0]
+        users   = await DB.get_clone_users(cid_db)
+        notice  = await msg.answer(f"⏳ Рассылка для {len(users)} юзеров клона…")
+        sent = failed = 0
+        for u in users:
+            try:
+                await clone_b.send_message(u["user_id"], text, parse_mode=ParseMode.HTML)
+                sent += 1
+                await asyncio.sleep(0.05)
+            except (TelegramForbiddenError, TelegramBadRequest):
+                failed += 1
+            except Exception:
+                failed += 1
+        await notice.edit_text(f"✅ Рассылка клона: {sent} отправлено, {failed} ошибок")
+
+    # ── Рассылка (admin) ─────────────────────────────────────────
+
+    @r.callback_query(F.data == "adm_broadcast")
+    async def _adm_broadcast(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        await q.message.edit_text(
+            "📢 <b>Рассылка</b>\n\nВыбери тип:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ikb(
+                [("📢 Всем через основной", "adm_bc_all")],
+                [("🤖 Через все боты сразу", "adm_bc_all_bots")],
+                [("👤 Конкретному пользователю", "adm_bc_single")],
+                [("🔙 Панель", "adm_back")],
+            ),
+        )
+        await q.answer()
+
+    @r.callback_query(F.data == "adm_bc_all")
+    async def _adm_bc_all_start(q: CallbackQuery, state: FSMContext):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        await state.update_data(bc_mode="main")
+        await q.message.edit_text(
+            "📢 Введи текст рассылки (HTML):",
+            reply_markup=ikb([("❌ Отмена", "adm_broadcast")]),
+        )
+        await state.set_state(AdminSt.broadcast_text)
+        await q.answer()
+
+    @r.callback_query(F.data == "adm_bc_all_bots")
+    async def _adm_bc_all_bots_start(q: CallbackQuery, state: FSMContext):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        await state.update_data(bc_mode="all_bots")
+        await q.message.edit_text(
+            "📢 Введи текст (HTML) — разошлю через все боты:",
+            reply_markup=ikb([("❌ Отмена", "adm_broadcast")]),
+        )
+        await state.set_state(AdminSt.broadcast_text)
+        await q.answer()
+
+    @r.message(StateFilter(AdminSt.broadcast_text))
+    async def _adm_bc_send(msg: Message, state: FSMContext):
+        if msg.from_user.id != ADMIN_ID: return
+        data    = await state.get_data()
+        bc_mode = data.get("bc_mode", "main")
+        text    = msg.text
+        await state.clear()
+        all_u  = await DB.all_users()
+        notice = await msg.answer(f"⏳ Рассылка для {len(all_u)} пользователей…")
+        sent = failed = 0
+        for u in all_u:
+            try:
+                await _bot().send_message(u["user_id"], text, parse_mode=ParseMode.HTML)
+                sent += 1
+                await asyncio.sleep(0.05)
+            except (TelegramForbiddenError, TelegramBadRequest):
+                failed += 1
+            except Exception:
+                failed += 1
+        # Через клоны тоже если all_bots
+        if bc_mode == "all_bots":
+            for token, (clone_b, _, _) in clone_bots.items():
+                async with DB._conn.execute(
+                    "SELECT id FROM cloned_bots WHERE bot_token=?", (token,)
+                ) as c:
+                    row = await c.fetchone()
+                if not row: continue
+                cu = await DB.get_clone_users(row["id"])
+                for cu_u in cu:
+                    try:
+                        await clone_b.send_message(cu_u["user_id"], text, parse_mode=ParseMode.HTML)
+                        sent += 1
+                        await asyncio.sleep(0.05)
+                    except Exception:
+                        failed += 1
+        await notice.edit_text(f"✅ Рассылка завершена!\n✉️ Отправлено: {sent}\n❌ Ошибок: {failed}")
+
+    @r.callback_query(F.data == "adm_bc_single")
+    async def _adm_bc_single_start(q: CallbackQuery, state: FSMContext):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        await q.message.edit_text(
+            "👤 Введи: <code>ID текст сообщения</code>\n"
+            "Пример: <code>7785371505 Привет!</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ikb([("❌ Отмена", "adm_broadcast")]),
+        )
+        await state.set_state(AdminSt.broadcast_single)
+        await q.answer()
+
+    @r.message(StateFilter(AdminSt.broadcast_single))
+    async def _adm_bc_single_send(msg: Message, state: FSMContext):
+        if msg.from_user.id != ADMIN_ID: return
+        data = await state.get_data()
+        uid_target = data.get("msg_uid")
+        await state.clear()
+        if uid_target:
+            # Это сообщение конкретному юзеру из карточки
+            try:
+                await _bot().send_message(uid_target, msg.text or "", parse_mode=ParseMode.HTML)
+                await msg.answer(f"✅ Отправлено пользователю {uid_target}")
+            except Exception as e:
+                await msg.answer(f"❌ Ошибка: {h(str(e))}")
+            return
+        # Формат: ID текст
+        parts = (msg.text or "").split(" ", 1)
+        if len(parts) < 2:
+            await msg.answer("❌ Формат: ID текст"); return
+        try:
+            uid  = int(parts[0])
+            txt  = parts[1]
+            await _bot().send_message(uid, txt, parse_mode=ParseMode.HTML)
+            await msg.answer(f"✅ Отправлено пользователю {uid}")
+        except Exception as e:
+            await msg.answer(f"❌ Ошибка: {h(str(e))}")
+
+    # ── Тикеты поддержки (admin) ──────────────────────────────────
+
+    @r.callback_query(F.data == "adm_tickets")
+    async def _adm_tickets(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        tickets = await DB.get_open_tickets()
+        if not tickets:
+            await q.message.edit_text(
+                "💬 Нет открытых тикетов.",
+                reply_markup=ikb([("🔙 Панель", "adm_back")])
+            )
+            await q.answer(); return
+        text = f"💬 <b>Открытые тикеты ({len(tickets)})</b>\n\n"
+        rows = []
+        for t in tickets[:10]:
+            nm  = h(t.get("first_name") or t.get("username") or str(t["user_id"]))
+            txt = h((t["message"] or "")[:50])
+            text += f"<b>#{t['id']}</b> от {nm}: {txt}…\n"
+            rows.append([(f"↩️ #{t['id']} — {nm[:12]}", f"adm_reply_{t['id']}_{t['user_id']}")])
+        rows.append([("🔙 Панель", "adm_back")])
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=ikb(*rows))
+        await q.answer()
+
+    @r.callback_query(F.data.startswith("adm_reply_"))
+    async def _adm_reply_start(q: CallbackQuery, state: FSMContext):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        parts = q.data.split("_")  # adm_reply_{tid}_{uid}
+        tid   = int(parts[2])
+        uid   = int(parts[3])
+        await state.update_data(reply_tid=tid, reply_uid=uid)
+        await q.message.answer(
+            f"↩️ Ответ на тикет <b>#{tid}</b> пользователю <code>{uid}</code>\n\nВведи текст:",
+            parse_mode=ParseMode.HTML,
+        )
+        await state.set_state(SupportSt.message)
+        await q.answer()
+
+    # ── Конфиг (admin) ────────────────────────────────────────────
 
     @r.callback_query(F.data == "adm_config")
     async def _adm_config(q: CallbackQuery):
         if q.from_user.id != ADMIN_ID:
             await q.answer(); return
-        
-        # v8.1: Расширенный конфиг
-        configs = {
-            "pyro_api_id": await DB.get_config("pyro_api_id"),
-            "pyro_api_hash": await DB.get_config("pyro_api_hash"),
-            "ref_goal": await DB.get_config("ref_goal"),
-            "clone_bonus_days": await DB.get_config("clone_bonus_days"),
-            "test_period_days": await DB.get_config("test_period_days"),
-            "auto_verify_enabled": await DB.get_config("auto_verify_enabled"),
-            "channel_check_hours": await DB.get_config("channel_check_hours"),
-            "save_dm_messages": await DB.get_config("save_dm_messages"),
-            "save_test_replies": await DB.get_config("save_test_replies"),
-        }
-        
+        api_id   = await DB.get_config("pyro_api_id")
+        api_hash = await DB.get_config("pyro_api_hash")
+        ref_goal = await DB.get_config("ref_goal")
+        bonus    = await DB.get_config("clone_bonus_days")
         text = (
-            f"🔧 <b>Конфиг системы v8.1</b>\n\n"
-            f"<b>API ключи (Userbot):</b>\n"
-            f"pyro_api_id: <code>{configs['pyro_api_id']}</code>\n"
-            f"pyro_api_hash: <code>{configs['pyro_api_hash'][:8]}...</code>\n\n"
-            f"<b>Система подписок:</b>\n"
-            f"ref_goal: <code>{configs['ref_goal']}</code>\n"
-            f"clone_bonus_days: <code>{configs['clone_bonus_days']}</code>\n"
-            f"test_period_days: <code>{configs['test_period_days']}</code>\n\n"
-            f"<b>Безопасность:</b>\n"
-            f"auto_verify_enabled: <code>{configs['auto_verify_enabled']}</code>\n"
-            f"channel_check_hours: <code>{configs['channel_check_hours']}</code>\n\n"
-            f"<b>Функции сохранения:</b>\n"
-            f"save_dm_messages: <code>{configs['save_dm_messages']}</code>\n"
-            f"save_test_replies: <code>{configs['save_test_replies']}</code>"
+            f"🔧 <b>Конфиг системы</b>\n\n"
+            f"pyro_api_id: <code>{api_id}</code>\n"
+            f"pyro_api_hash: <code>{api_hash[:8]}…</code>\n"
+            f"ref_goal: <code>{ref_goal}</code>\n"
+            f"clone_bonus_days: <code>{bonus}</code>\n"
         )
-        
         await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=ikb(
             [("✏️ pyro_api_id", "adm_cfg_pyro_api_id"),
              ("✏️ pyro_api_hash", "adm_cfg_pyro_api_hash")],
             [("✏️ ref_goal", "adm_cfg_ref_goal"),
-             ("✏️ clone_bonus", "adm_cfg_clone_bonus_days")],
-            [("✏️ test_period", "adm_cfg_test_period_days"),
-             ("✏️ auto_verify", "adm_cfg_auto_verify_enabled")],
-            [("✏️ check_hours", "adm_cfg_channel_check_hours"),
-             ("✏️ save_dm", "adm_cfg_save_dm_messages")],
-            [("✏️ save_test", "adm_cfg_save_test_replies")],
+             ("✏️ clone_bonus_days", "adm_cfg_clone_bonus_days")],
             [("🔙 Панель", "adm_back")],
         ))
         await q.answer()
@@ -2690,9 +2689,8 @@ def create_router(is_clone: bool = False,
         val  = msg.text.strip()
         await DB.set_config(key, val)
         await state.clear()
-        
-        # Обновляем глобальные переменные
-        global PYRO_API_ID, PYRO_API_HASH, REF_GOAL, CLONE_BONUS_DAYS, TEST_PERIOD_DAYS
+        # Обновляем глобальные переменные если нужно
+        global PYRO_API_ID, PYRO_API_HASH, REF_GOAL, CLONE_BONUS_DAYS
         if key == "pyro_api_id":
             try: PYRO_API_ID = int(val)
             except: pass
@@ -2704,18 +2702,64 @@ def create_router(is_clone: bool = False,
         elif key == "clone_bonus_days":
             try: CLONE_BONUS_DAYS = int(val)
             except: pass
-        elif key == "test_period_days":
-            try: TEST_PERIOD_DAYS = int(val)
-            except: pass
-        
         await msg.answer(f"✅ Сохранено: <b>{key}</b> = <code>{h(val)}</code>",
                          parse_mode=ParseMode.HTML,
                          reply_markup=ikb([("🔙 Конфиг", "adm_config")]))
 
-    # ... Остальной код admin-панели (пользователи, клоны, тикеты и т.д.)
-    # оставляю таким же, как в оригинале для экономии места
+    # ── Диалоги (admin) ───────────────────────────────────────────
 
-    # ── Business Connection & Messages ────────────────────────────
+    @r.callback_query(F.data == "adm_dialogs")
+    async def _adm_dialogs(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        users = await DB.get_all_dialog_users()
+        text  = f"<b>💬 Диалоги ({len(users)} уникальных)</b>\n\n"
+        rows  = []
+        for u in users[:20]:
+            nm = h((u.get("first_name") or u.get("username") or str(u["user_id"]))[:20])
+            text += f"• <code>{u['user_id']}</code> {nm}\n"
+            rows.append([(f"👤 {nm[:15]}", f"adm_dialog_{u['user_id']}")])
+        rows.append([("🔙 Панель", "adm_back")])
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=ikb(*rows))
+        await q.answer()
+
+    @r.callback_query(F.data.startswith("adm_dialog_"))
+    async def _adm_dialog_detail(q: CallbackQuery):
+        if q.from_user.id != ADMIN_ID:
+            await q.answer(); return
+        uid  = int(q.data[11:])
+        hist = await DB.get_user_deletion_history(uid, 10)
+        text = f"<b>💬 История — {uid}</b>\n\n"
+        for row in hist:
+            ts   = (row["deleted_at"] or "")[:16]
+            mtyp = mtype_icon(row["msg_type"])
+            chn  = h((row["chat_title"] or "")[:15])
+            cnt  = h((row["content"] or "")[:25])
+            text += f"• {ts} {mtyp} {chn}: {cnt}\n"
+        if not hist:
+            text += "Нет записей."
+        await q.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=ikb(
+            [("🔙 Диалоги", "adm_dialogs")]
+        ))
+        await q.answer()
+
+    # ── /send команда ─────────────────────────────────────────────
+
+    @r.message(Command("send"))
+    async def _cmd_send(msg: Message):
+        if msg.from_user.id != ADMIN_ID: return
+        parts = (msg.text or "").split(" ", 2)
+        if len(parts) < 3:
+            await msg.answer("Формат: /send ID текст"); return
+        try:
+            uid = int(parts[1])
+            txt = parts[2]
+            await _bot().send_message(uid, txt, parse_mode=ParseMode.HTML)
+            await msg.answer(f"✅ Отправлено {uid}")
+        except Exception as e:
+            await msg.answer(f"❌ {h(str(e))}")
+
+    # ── Business Connection ───────────────────────────────────────
 
     @r.business_connection()
     async def _on_biz_conn(conn: BusinessConnection):
@@ -2744,7 +2788,152 @@ def create_router(is_clone: bool = False,
             except Exception:
                 pass
 
-    # ... Business messages handlers (оставляю как в оригинале)
+    # ── Business Messages (Bot Mode) ─────────────────────────────
+
+    @r.business_message()
+    async def _on_biz_msg(msg: Message):
+        if not msg.business_connection_id: return
+        try:
+            conn = await _bot().get_business_connection(msg.business_connection_id)
+            owner_id = conn.user.id
+            u = await DB.get_user(owner_id)
+            if not u or not u["biz_connected"] or not u["monitoring_on"]: return
+            mtype   = "text"
+            content = msg.text or msg.caption or ""
+            if msg.photo:        mtype = "photo"
+            elif msg.video:      mtype = "video"
+            elif msg.voice:      mtype = "voice"
+            elif msg.video_note: mtype = "video_note"
+            elif msg.document:   mtype = "document"
+            elif msg.sticker:    mtype = "sticker"
+            elif msg.animation:  mtype = "animation"
+            sender = msg.from_user.full_name if msg.from_user else "Unknown"
+            chat_t = getattr(msg.chat, "title", None) or str(msg.chat.id)
+            entry  = {"cid": msg.chat.id, "mid": msg.message_id, "type": mtype,
+                      "sender": sender, "title": chat_t, "text": content,
+                      "file_id": None, "media_bytes": None}
+            mem_cache[owner_id].append(entry)
+            # Скачиваем медиа для Bot Mode если можем
+            media_raw = None
+            if mtype in ("photo", "voice", "video_note") and msg.media_group_id is None:
+                try:
+                    file_id = None
+                    if msg.photo:        file_id = msg.photo[-1].file_id
+                    elif msg.voice:      file_id = msg.voice.file_id
+                    elif msg.video_note: file_id = msg.video_note.file_id
+                    if file_id:
+                        fi = await _bot().get_file(file_id)
+                        dl = await _bot().download_file(fi.file_path)
+                        media_raw = dl.read()
+                        entry["media_bytes"] = media_raw
+                except Exception:
+                    pass
+            asyncio.create_task(
+                DB.cache_msg(owner_id, msg.chat.id, msg.message_id,
+                             msg.from_user.id if msg.from_user else 0,
+                             sender, chat_t, mtype, content,
+                             media_bytes=media_raw)
+            )
+        except Exception as e:
+            log.debug(f"biz_msg err: {e}")
+
+    @r.edited_business_message()
+    async def _on_biz_edit(msg: Message):
+        if not msg.business_connection_id: return
+        try:
+            conn = await _bot().get_business_connection(msg.business_connection_id)
+            owner_id = conn.user.id
+            u = await DB.get_user(owner_id)
+            if not u or not u["biz_connected"] or not u["monitoring_on"]: return
+            new_text = msg.text or msg.caption or ""
+            cached   = _mem_get(owner_id, msg.chat.id, msg.message_id)
+            old_text = cached["text"] if cached else "—"
+            sender   = msg.from_user.full_name if msg.from_user else "Unknown"
+            chat_t   = getattr(msg.chat, "title", None) or str(msg.chat.id)
+            await _bot().send_message(
+                owner_id, notif_edited(sender, chat_t, old_text, new_text),
+                parse_mode=ParseMode.HTML
+            )
+            asyncio.create_task(DB.log_edit(owner_id, msg.chat.id, chat_t, sender, old_text, new_text))
+            if cached:
+                cached["text"] = new_text
+        except Exception as e:
+            log.debug(f"biz_edit err: {e}")
+
+    @r.deleted_business_messages()
+    async def _on_biz_del(evt):
+        try:
+            conn = await _bot().get_business_connection(evt.business_connection_id)
+            owner_id = conn.user.id
+            u = await DB.get_user(owner_id)
+            if not u or not u["biz_connected"] or not u["monitoring_on"]: return
+            chat_id = evt.chat.id
+            chat_t  = getattr(evt.chat, "title", None) or str(chat_id)
+            ids     = list(evt.message_ids or [])
+            is_bulk = await DB.check_bulk_delete(owner_id, chat_id, len(ids))
+            if is_bulk:
+                await DB.reset_bulk_events(owner_id)
+                await _bot().send_message(
+                    owner_id, notif_bulk(chat_t, len(ids)), parse_mode=ParseMode.HTML
+                )
+                try:
+                    zdata = await build_zip(owner_id, chat_id, chat_t)
+                    fn = f"merai_{chat_t[:12]}_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+                    await _bot().send_document(
+                        owner_id, BufferedInputFile(zdata, filename=fn),
+                        caption=f"📦 Архив: <b>{h(chat_t)}</b>", parse_mode=ParseMode.HTML
+                    )
+                except Exception as ze:
+                    log.error(f"ZIP biz err: {ze}")
+                return
+            for mid in ids:
+                cached = _mem_get(owner_id, chat_id, mid)
+                if cached:
+                    mtype  = cached["type"]
+                    sender = cached["sender"]
+                    mb     = cached.get("media_bytes")
+                    asyncio.create_task(
+                        DB.log_deletion(owner_id, chat_id, chat_t, sender, mtype, cached.get("text"))
+                    )
+                    if mtype == "text":
+                        await _bot().send_message(
+                            owner_id,
+                            notif_deleted_text(sender, chat_t, cached.get("text") or ""),
+                            parse_mode=ParseMode.HTML
+                        )
+                    else:
+                        note = notif_deleted_media(sender, chat_t, mtype)
+                        sent = False
+                        if mb:
+                            ext_map = {"photo": "jpg", "video": "mp4", "voice": "ogg", "video_note": "mp4"}
+                            ext = ext_map.get(mtype, "dat")
+                            bif = BufferedInputFile(mb, filename=f"del_{mid}.{ext}")
+                            try:
+                                if mtype == "photo":
+                                    await _bot().send_photo(owner_id, bif, caption=note, parse_mode=ParseMode.HTML)
+                                elif mtype in ("video", "video_note"):
+                                    await _bot().send_video(owner_id, bif, caption=note, parse_mode=ParseMode.HTML)
+                                elif mtype == "voice":
+                                    await _bot().send_voice(owner_id, bif, caption=note, parse_mode=ParseMode.HTML)
+                                else:
+                                    await _bot().send_document(owner_id, bif, caption=note, parse_mode=ParseMode.HTML)
+                                sent = True
+                            except Exception:
+                                pass
+                        if not sent:
+                            await _bot().send_message(owner_id, note, parse_mode=ParseMode.HTML)
+                else:
+                    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+                    await _bot().send_message(
+                        owner_id,
+                        f"🗑 <b>Сообщение удалено</b>\n"
+                        f"┌ 💬 <b>Чат:</b> {h(chat_t)}\n"
+                        f"├ 🔢 <b>ID:</b> {mid}\n"
+                        f"└ 🕐 <b>Время:</b> {ts}\n<i>(не в кэше)</i>",
+                        parse_mode=ParseMode.HTML
+                    )
+        except Exception as e:
+            log.debug(f"biz_del err: {e}")
 
     # ── Fallback ──────────────────────────────────────────────────
 
@@ -2758,26 +2947,13 @@ def create_router(is_clone: bool = False,
             return
         if user["is_banned"]:
             await msg.answer("🚫 Ваш аккаунт заблокирован."); return
-        
-        # v8.1: Проверка канала
-        if user["channel_left"]:
-            await msg.answer(
-                f"❌ <b>Вы покинули канал верификации!</b>\n\n"
-                f"Для продолжения работы вступите обратно:\n{CAPTCHA_CHANNEL}",
-                parse_mode=ParseMode.HTML
-            )
-            return
-        
         await _show_main(msg, user, POWERED_BY)
 
     return r
 
 # ═══════════════════════════════════════════════════════════════════
-#  8-11. ОСТАЛЬНЫЕ ФУНКЦИИ (без изменений или с минимальными)
+#  8. КЛОНИРОВАНИЕ — ЗАПУСК КЛОН-БОТА
 # ═══════════════════════════════════════════════════════════════════
-
-# Функции клонирования, восстановления сессий, фоновые задачи...
-# (Оставляю их как в оригинале для экономии места)
 
 async def launch_clone(token: str, owner_id: int, clone_id: int = None):
     try:
@@ -2794,6 +2970,7 @@ async def launch_clone(token: str, owner_id: int, clone_id: int = None):
         dp_clone.include_router(clone_router)
         log.info(f"Clone bot launched owner={owner_id} clone_id={clone_id}")
 
+        # Запускаем polling клона в фоне
         task = asyncio.create_task(
             dp_clone.start_polling(
                 clone_bot,
@@ -2813,6 +2990,7 @@ async def launch_clone(token: str, owner_id: int, clone_id: int = None):
         if token in clone_bots:
             del clone_bots[token]
 
+
 async def stop_clone(token: str):
     if token in clone_bots:
         clone_bot, dp, task = clone_bots[token]
@@ -2823,10 +3001,13 @@ async def stop_clone(token: str):
             pass
         del clone_bots[token]
 
+# ═══════════════════════════════════════════════════════════════════
+#  9. ВОССТАНОВЛЕНИЕ СЕССИЙ
+# ═══════════════════════════════════════════════════════════════════
+
 async def restore_sessions():
-    """v8.1: Восстановление с проверкой trial"""
     log.info("Восстанавливаю активные сессии и клоны…")
-    await asyncio.sleep(2)
+    await asyncio.sleep(2)  # Даём боту стартовать
     users = await DB.all_users()
     for u in users:
         if u.get("ub_session") and u.get("ub_active") and u.get("monitoring_on"):
@@ -2841,14 +3022,18 @@ async def restore_sessions():
         if c["is_active"]:
             asyncio.create_task(launch_clone(c["bot_token"], c["owner_id"], c["id"]))
 
+# ═══════════════════════════════════════════════════════════════════
+#  10. ФОНОВЫЕ ЗАДАЧИ
+# ═══════════════════════════════════════════════════════════════════
+
 async def autorenew_task():
-    """Авто-продление подписок"""
+    """Каждый час проверяет подписки с auto_renew и отправляет инвойс."""
     while True:
         await asyncio.sleep(3600)
         try:
             users = await DB.all_users()
             for u in users:
-                if u["auto_renew"] and u["plan"] not in ("trial", "free") and u["plan_expires"]:
+                if u["auto_renew"] and u["plan"] != "free" and u["plan_expires"]:
                     try:
                         exp = datetime.fromisoformat(u["plan_expires"])
                         if exp.tzinfo is None:
@@ -2869,78 +3054,25 @@ async def autorenew_task():
         except Exception as e:
             log.error(f"autorenew_task err: {e}")
 
-async def channel_check_task():
-    """
-    v8.1: Фоновая задача проверки членства в канале
-    Каждый час проверяет всех активных пользователей
-    """
-    while True:
-        check_interval = int(await DB.get_config("channel_check_hours", "1"))
-        await asyncio.sleep(check_interval * 3600)
-        
-        try:
-            users = await DB.all_users()
-            for u in users:
-                if not u["is_verified"] or u["is_banned"]:
-                    continue
-                
-                # Проверяем только если прошло достаточно времени
-                last_check = u.get("last_channel_check")
-                if last_check:
-                    try:
-                        last_dt = datetime.fromisoformat(last_check)
-                        if last_dt.tzinfo is None:
-                            last_dt = last_dt.replace(tzinfo=timezone.utc)
-                        if datetime.now(timezone.utc) - last_dt < timedelta(hours=check_interval):
-                            continue
-                    except Exception:
-                        pass
-                
-                # Проверяем членство
-                is_member = await check_channel_membership(bot_instance, u["user_id"])
-                
-                # Если пользователь вышел - отправляем уведомление
-                if not is_member and not u["channel_left"]:
-                    try:
-                        await bot_instance.send_message(
-                            u["user_id"],
-                            f"⚠️ <b>Обнаружен выход из канала!</b>\n\n"
-                            f"Ты покинул канал верификации. "
-                            f"Для продолжения работы вернись в канал:\n{CAPTCHA_CHANNEL}\n\n"
-                            f"Бот остановлен до твоего возвращения.",
-                            parse_mode=ParseMode.HTML
-                        )
-                        # Останавливаем мониторинг
-                        await DB.set_field(u["user_id"], "monitoring_on", 0)
-                        if u["user_id"] in ub_clients:
-                            asyncio.create_task(stop_userbot(u["user_id"]))
-                    except Exception:
-                        pass
-        except Exception as e:
-            log.error(f"channel_check_task err: {e}")
-
 # ═══════════════════════════════════════════════════════════════════
-#  MAIN
+#  11. MAIN
 # ═══════════════════════════════════════════════════════════════════
 
 async def main():
-    global bot_instance, BOT_USERNAME, PYRO_API_ID, PYRO_API_HASH, REF_GOAL, CLONE_BONUS_DAYS, TEST_PERIOD_DAYS
+    global bot_instance, BOT_USERNAME, PYRO_API_ID, PYRO_API_HASH, REF_GOAL, CLONE_BONUS_DAYS
 
     await DB.connect()
 
-    # Загружаем конфиг v8.1
+    # Загружаем конфиг из БД
     pyro_id   = await DB.get_config("pyro_api_id", "0")
     pyro_hash = await DB.get_config("pyro_api_hash", "")
     ref_goal  = await DB.get_config("ref_goal", "50")
     bonus     = await DB.get_config("clone_bonus_days", "3")
-    test_days = await DB.get_config("test_period_days", "3")
-    
     try:
         if int(pyro_id): PYRO_API_ID = int(pyro_id)
         if pyro_hash:    PYRO_API_HASH = pyro_hash
         REF_GOAL         = int(ref_goal)
         CLONE_BONUS_DAYS = int(bonus)
-        TEST_PERIOD_DAYS = int(test_days)
     except Exception:
         pass
 
@@ -2951,7 +3083,7 @@ async def main():
 
     me           = await bot_instance.get_me()
     BOT_USERNAME = me.username
-    log.info(f"🚀 Бот @{BOT_USERNAME} (ID {me.id}) v8.1 стартует…")
+    log.info(f"🚀 Бот @{BOT_USERNAME} (ID {me.id}) стартует…")
 
     from aiogram.types import BotCommand
     await bot_instance.set_my_commands([
@@ -2968,12 +3100,10 @@ async def main():
     main_router = create_router(is_clone=False)
     dp.include_router(main_router)
 
-    # v8.1: Запуск фоновых задач
     asyncio.create_task(restore_sessions())
     asyncio.create_task(autorenew_task())
-    asyncio.create_task(channel_check_task())
 
-    log.info("✅ Запуск polling v8.1…")
+    log.info("✅ Запуск polling…")
     try:
         await dp.start_polling(
             bot_instance,
@@ -2993,6 +3123,7 @@ async def main():
         await bot_instance.session.close()
         await DB.close()
         log.info("👋 Бот остановлен.")
+
 
 if __name__ == "__main__":
     try:
