@@ -1,5 +1,5 @@
 # MerAi & Monitoring v8.0
-# Python 3.11+ | Март 2026
+# Python 3.11+ | Актуальные версии на 10.03.2026
 # Хостинг: BotHost for Telegram
 
 # ── Telegram Bot Framework ──────────────────────────────
