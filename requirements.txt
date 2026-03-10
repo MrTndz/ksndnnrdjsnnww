@@ -1,18 +1,15 @@
-# MerAi & Monitoring v7.0
-# Python 3.11+ | Актуальные версии на 09.03.2026
-# Хостинг: BotHost for Telegram
+# MerAi & Monitoring v6.0 - ФИНАЛЬНАЯ ВЕРСИЯ
+# Дата: 9 марта 2026, 23:35 МСК
 
-# ── Telegram Bot Framework ──────────────────────────────
+# Telegram Bot Framework
 aiogram==3.26.0
 
-# ── Userbot (MTProto) ───────────────────────────────────
+# UserBot (MTProto)
 Pyrogram==2.0.106
 TgCrypto==1.2.5
 
-# ── База данных ─────────────────────────────────────────
+# База данных
 aiosqlite==0.20.0
 
-# ── Утилиты ─────────────────────────────────────────────
+# Утилиты
 aiohttp==3.10.5
-aiofiles==24.1.0
-python-dotenv==1.0.1
